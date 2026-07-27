@@ -10,6 +10,8 @@ new Env('MT论坛签到')
   MT_NOTIFY       是否发送青龙面板系统通知，默认为 true。
   MT_TIMEOUT      单次网络请求超时秒数，默认为 20。
   MT_ACCOUNT_DELAY 多账号之间的等待秒数，默认为 3。
+  MT_RANDOM_SIGNIN 是否启用启动前随机延迟，默认为 true。
+  MT_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600。
 
 通知使用青龙注入的 QLAPI.systemNotify，直接复用面板通知设置。
 """
@@ -19,6 +21,7 @@ from __future__ import annotations
 import builtins
 import html
 import os
+import random
 import re
 import sys
 import time
@@ -42,6 +45,7 @@ SIGN_ENDPOINT_URL = urljoin(BASE_URL, "plugin.php")
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
+DEFAULT_RANDOM_DELAY_MAX_SECONDS = 3600.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -481,6 +485,30 @@ def read_boolean_environment(variable_name: str, default_value: bool) -> bool:
     return raw_value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def format_time_remaining(seconds: float) -> str:
+    """将秒数格式化为人类可读的时长描述。"""
+    total_seconds = int(seconds)
+    if total_seconds <= 0:
+        return "立即执行"
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}小时{minutes}分{secs}秒"
+    if minutes > 0:
+        return f"{minutes}分{secs}秒"
+    return f"{secs}秒"
+
+
+def wait_with_countdown(delay_seconds: float, task_name: str) -> None:
+    """随机延迟等待，期间定期打印剩余时间倒计时。"""
+    remaining = delay_seconds
+    while remaining > 0:
+        print(f"{task_name} 倒计时：{format_time_remaining(remaining)}")
+        sleep_seconds = 1 if remaining <= 10 else min(10, remaining)
+        time.sleep(sleep_seconds)
+        remaining -= sleep_seconds
+
+
 def send_system_notification(title: str, content: str) -> bool:
     qinglong_api: Any = getattr(builtins, "QLAPI", None)
     if qinglong_api is None:
@@ -552,6 +580,18 @@ def main() -> int:
         "MT_ACCOUNT_DELAY",
         DEFAULT_ACCOUNT_DELAY_SECONDS,
     )
+
+    # 启动前随机延迟，避免固定时间签到触发风控
+    random_signin_enabled = read_boolean_environment("MT_RANDOM_SIGNIN", True)
+    if random_signin_enabled:
+        max_random_delay = read_positive_float_environment(
+            "MT_RANDOM_DELAY_MAX",
+            DEFAULT_RANDOM_DELAY_MAX_SECONDS,
+        )
+        if max_random_delay > 0:
+            delay_seconds = random.uniform(0, max_random_delay)
+            print(f"🎲 随机延迟：{format_time_remaining(delay_seconds)}")
+            wait_with_countdown(delay_seconds, "MT论坛签到")
 
     results: list[CheckinResult] = []
     for account_index, credential in enumerate(credentials, start=1):
