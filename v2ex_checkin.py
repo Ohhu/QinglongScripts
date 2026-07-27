@@ -6,10 +6,11 @@ new Env('V2EX签到')
 
 环境变量：
   V2EX_COOKIE          必填。浏览器 F12 抓取的完整 Cookie，多账号换行分隔。
-  V2EX_RANDOM_SIGNIN   是否启用启动前随机延迟，默认为 true。
-  V2EX_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600。
   V2EX_PRIVACY_MODE    通知中是否对用户名脱敏，默认为 true。
-  V2EX_TIMEOUT         单次请求超时秒数，默认为 15。
+  TASK_RANDOM_SIGNIN   是否启用启动前随机延迟，默认为 true（所有任务共用）。
+  TASK_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600（所有任务共用）。
+  TASK_TIMEOUT         单次请求超时秒数，默认为 20（所有任务共用）。
+  TASK_ACCOUNT_DELAY   多账号间间隔秒数，默认为 3（所有任务共用）。
 
 通知复用青龙注入的 QLAPI.systemNotify，直接走面板通知设置。
 """
@@ -381,16 +382,16 @@ def main() -> int:
         print(f"[配置错误] {error}")
 
     request_timeout_seconds = read_positive_float_environment(
-        "V2EX_TIMEOUT",
-        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        "TASK_TIMEOUT",
+        20.0,
     )
 
     # 启动前随机延迟，避免固定时间签到
-    random_signin_enabled = read_boolean_environment("V2EX_RANDOM_SIGNIN", True)
+    random_signin_enabled = read_boolean_environment("TASK_RANDOM_SIGNIN", True)
     if random_signin_enabled:
         max_random_delay = read_positive_float_environment(
-            "V2EX_RANDOM_DELAY_MAX",
-            DEFAULT_RANDOM_DELAY_MAX_SECONDS,
+            "TASK_RANDOM_DELAY_MAX",
+            3600.0,
         )
         if max_random_delay > 0:
             delay_seconds = random.uniform(0, max_random_delay)
@@ -414,9 +415,10 @@ def main() -> int:
 
         has_next_account = account_index < len(cookies)
         if has_next_account:
-            account_gap = random.uniform(10, 20)
-            print(f"等待 {account_gap:.1f} 秒后处理下一个账号")
-            time.sleep(account_gap)
+            account_gap = read_positive_float_environment("TASK_ACCOUNT_DELAY", 3.0)
+            if account_gap > 0:
+                print(f"等待 {account_gap:g} 秒后处理下一个账号")
+                time.sleep(account_gap)
 
     notification_content = build_notification_content(
         results,

@@ -15,9 +15,10 @@ from datetime import datetime, timedelta
 
 # 配置项
 BAIDU_COOKIE = os.environ.get('BAIDU_COOKIE', '')
-max_random_delay = int(os.getenv("MAX_RANDOM_DELAY", "3600"))
-random_signin = os.getenv("RANDOM_SIGNIN", "true").lower() == "true"
+random_signin = os.getenv("TASK_RANDOM_SIGNIN", "true").lower() == "true"
+max_random_delay = int(os.getenv("TASK_RANDOM_DELAY_MAX", "3600"))
 privacy_mode = os.getenv("PRIVACY_MODE", "true").lower() == "true"
+task_timeout = int(os.getenv("TASK_TIMEOUT", "20"))
 
 HEADERS = {
     'Connection': 'keep-alive',
@@ -102,7 +103,7 @@ class BaiduPan:
         signed_headers['Cookie'] = self.cookie
         
         try:
-            resp = requests.get(url, headers=signed_headers, timeout=15)
+            resp = requests.get(url, headers=signed_headers, timeout=task_timeout)
             print(f"🔍 签到响应状态码: {resp.status_code}")
             
             if resp.status_code == 200:
@@ -156,7 +157,7 @@ class BaiduPan:
         signed_headers['Cookie'] = self.cookie
         
         try:
-            resp = requests.get(url, headers=signed_headers, timeout=15)
+            resp = requests.get(url, headers=signed_headers, timeout=task_timeout)
             if resp.status_code == 200:
                 answer = re.search(r'"answer":(\d+)', resp.text)
                 ask_id = re.search(r'"ask_id":(\d+)', resp.text)
@@ -189,7 +190,7 @@ class BaiduPan:
         signed_headers['Cookie'] = self.cookie
         
         try:
-            resp = requests.get(url, headers=signed_headers, timeout=15)
+            resp = requests.get(url, headers=signed_headers, timeout=task_timeout)
             if resp.status_code == 200:
                 answer_msg = re.search(r'"show_msg":"(.*?)"', resp.text)
                 answer_score = re.search(r'"score":(\d+)', resp.text)
@@ -232,7 +233,7 @@ class BaiduPan:
         signed_headers['Cookie'] = self.cookie
         
         try:
-            resp = requests.get(url, headers=signed_headers, timeout=15)
+            resp = requests.get(url, headers=signed_headers, timeout=task_timeout)
             if resp.status_code == 200:
                 current_value = re.search(r'current_value":(\d+)', resp.text)
                 current_level = re.search(r'current_level":(\d+)', resp.text)
@@ -382,11 +383,12 @@ def main():
     
     for index, cookie in enumerate(cookies):
         try:
-            # 账号间随机等待
+            # 账号间等待
             if index > 0:
-                delay = random.uniform(10, 20)
-                print(f"⏱️  随机等待 {delay:.1f} 秒后处理下一个账号...")
-                time.sleep(delay)
+                account_delay = int(os.getenv("TASK_ACCOUNT_DELAY", "3"))
+                if account_delay > 0:
+                    print(f"⏱️  等待 {account_delay} 秒后处理下一个账号...")
+                    time.sleep(account_delay)
             
             # 执行签到
             baidu_pan = BaiduPan(cookie, index + 1)

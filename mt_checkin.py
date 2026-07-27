@@ -8,10 +8,10 @@ new Env('MT论坛签到')
   mt              账号和密码，格式为“账号|密码”，多账号使用换行分隔。
   MT_ACCOUNTS     与 mt 格式相同；设置后优先于 mt。
   MT_NOTIFY       是否发送青龙面板系统通知，默认为 true。
-  MT_TIMEOUT      单次网络请求超时秒数，默认为 20。
-  MT_ACCOUNT_DELAY 多账号之间的等待秒数，默认为 3。
-  MT_RANDOM_SIGNIN 是否启用启动前随机延迟，默认为 true。
-  MT_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600。
+  TASK_RANDOM_SIGNIN 是否启用启动前随机延迟，默认为 true（所有任务共用）。
+  TASK_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600（所有任务共用）。
+  TASK_TIMEOUT    单次网络请求超时秒数，默认为 20（所有任务共用）。
+  TASK_ACCOUNT_DELAY 多账号之间的等待秒数，默认为 3（所有任务共用）。
 
 通知使用青龙注入的 QLAPI.systemNotify，直接复用面板通知设置。
 """
@@ -45,7 +45,6 @@ SIGN_ENDPOINT_URL = urljoin(BASE_URL, "plugin.php")
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
-DEFAULT_RANDOM_DELAY_MAX_SECONDS = 3600.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -573,20 +572,20 @@ def main() -> int:
         print(f"[配置错误] {configuration_error}")
 
     request_timeout_seconds = read_positive_float_environment(
-        "MT_TIMEOUT",
+        "TASK_TIMEOUT",
         DEFAULT_REQUEST_TIMEOUT_SECONDS,
     )
     account_delay_seconds = read_positive_float_environment(
-        "MT_ACCOUNT_DELAY",
+        "TASK_ACCOUNT_DELAY",
         DEFAULT_ACCOUNT_DELAY_SECONDS,
     )
 
     # 启动前随机延迟，避免固定时间签到触发风控
-    random_signin_enabled = read_boolean_environment("MT_RANDOM_SIGNIN", True)
+    random_signin_enabled = read_boolean_environment("TASK_RANDOM_SIGNIN", True)
     if random_signin_enabled:
         max_random_delay = read_positive_float_environment(
-            "MT_RANDOM_DELAY_MAX",
-            DEFAULT_RANDOM_DELAY_MAX_SECONDS,
+            "TASK_RANDOM_DELAY_MAX",
+            3600.0,
         )
         if max_random_delay > 0:
             delay_seconds = random.uniform(0, max_random_delay)
