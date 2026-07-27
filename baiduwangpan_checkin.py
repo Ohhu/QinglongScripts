@@ -10,17 +10,8 @@ import time
 import re
 import requests
 import random
+import builtins
 from datetime import datetime, timedelta
-
-# ---------------- 统一通知模块加载 ----------------
-hadsend = False
-send = None
-try:
-    from notify import send
-    hadsend = True
-    print("✅ 已加载notify.py通知模块")
-except ImportError:
-    print("⚠️  未加载通知模块，跳过通知功能")
 
 # 配置项
 BAIDU_COOKIE = os.environ.get('BAIDU_COOKIE', '')
@@ -72,15 +63,19 @@ def wait_with_countdown(delay_seconds, task_name):
         remaining -= sleep_time
 
 def notify_user(title, content):
-    """统一通知函数"""
-    if hadsend:
-        try:
-            send(title, content)
-            print(f"✅ 通知发送完成: {title}")
-        except Exception as e:
-            print(f"❌ 通知发送失败: {e}")
-    else:
-        print(f"📢 {title}\n📄 {content}")
+    """统一通知函数：使用青龙系统通知"""
+    qinglong_api = getattr(builtins, "QLAPI", None)
+    if qinglong_api is None:
+        print(f"[通知] 非青龙环境，跳过：{title}")
+        return
+    try:
+        response = qinglong_api.systemNotify({"title": title, "content": content})
+        if isinstance(response, dict) and response.get("code") == 200:
+            print(f"✅ 通知发送完成：{title}")
+        else:
+            print(f"❌ 系统通知返回异常：{response}")
+    except Exception as error:
+        print(f"❌ 系统通知调用失败：{type(error).__name__}: {error}")
 
 class BaiduPan:
     name = "百度网盘"
