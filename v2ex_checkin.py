@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cron: 7 9 * * *
+cron: 0 9 * * *
 new Env('V2EX签到')
 
 环境变量：
@@ -124,9 +124,12 @@ class V2exCheckinClient:
                     "未找到签到按钮，页面结构可能已变化",
                 )
 
-            redeem_response_text = self._submit_redeem(once_token)
-            if self._redeem_succeeded(redeem_response_text):
-                refreshed_page_text = self._fetch_daily_page()
+            # 兑换 once；V2EX 此接口返回 302 或简洁 JSON，响应体不一定含成功字样
+            self._submit_redeem(once_token)
+
+            # 以兑换后重新拉取的签到页为准，判断是否真的领到
+            refreshed_page_text = self._fetch_daily_page()
+            if self._already_checked_in(refreshed_page_text):
                 details = self._extract_user_details(refreshed_page_text)
                 account_label = details.get("username") or account_label
                 return CheckinResult(
@@ -141,7 +144,7 @@ class V2exCheckinClient:
             return self._failure_result(
                 account_number,
                 account_label,
-                "兑换 once 后未检测到成功标识",
+                "兑换 once 后签到页仍未显示已领取",
             )
 
         except requests.Timeout:
@@ -201,10 +204,6 @@ class V2exCheckinClient:
 
     @staticmethod
     def _already_checked_in(page_text: str) -> bool:
-        return "每日登录奖励已领取" in page_text
-
-    @staticmethod
-    def _redeem_succeeded(page_text: str) -> bool:
         return "每日登录奖励已领取" in page_text
 
     @staticmethod
