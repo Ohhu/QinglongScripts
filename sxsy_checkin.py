@@ -26,13 +26,19 @@ new Env('尚香书苑签到')
 脚本下载该图片后用 EasyOCR 云端识别域名；识别失败回退上次成功的
 域名缓存，再失败使用内置默认域名。
 
+Cookie 持久化：账密登录成功后把最新 Cookie 存入本地文件
+（/ql/data/scripts_data/sxsy_cookies.json），之后运行优先用本地存储的
+Cookie，失效后自动清理并依次回退环境变量 Cookie、账密重新登录。
+
 通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
 
 from __future__ import annotations
 
 import builtins
+import hashlib
 import html
+import json
 import os
 import random
 import re
@@ -52,12 +58,19 @@ EASYOCR_API_URL = "https://console.easyocr.org/api/ocr"
 RELEASE_PAGE_URL = "https://sxsy.org/"
 DOMAIN_IMAGE_PATH = "site.jpg"
 DEFAULT_HOST = "sxsy13.com"
-DOMAIN_CACHE_PATH = "/ql/data/sxsy_last_host"
-if not os.path.isdir(os.path.dirname(DOMAIN_CACHE_PATH)):
-    DOMAIN_CACHE_PATH = os.path.join(
+
+# 本地数据统一放在 /ql/data/scripts_data/（青龙持久卷），
+# 非青龙环境降级到脚本旁 ./scripts_data/，目录不存在时自动创建。
+QINGLONG_DATA_DIR = "/ql/data/scripts_data"
+if not os.path.isdir(QINGLONG_DATA_DIR):
+    QINGLONG_DATA_DIR = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        ".sxsy_last_host",
+        "scripts_data",
     )
+os.makedirs(QINGLONG_DATA_DIR, exist_ok=True)
+
+DOMAIN_CACHE_PATH = os.path.join(QINGLONG_DATA_DIR, "sxsy_last_host")
+COOKIE_STORE_PATH = os.path.join(QINGLONG_DATA_DIR, "sxsy_cookies.json")
 
 HOST_PATTERN = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.IGNORECASE)
 FORM_HASH_PATTERN = re.compile(r'name="formhash"\s+value="([a-zA-Z0-9]{8})"')
@@ -206,6 +219,57 @@ def recognize_image_with_ocr(
     return recognized_text
 
 
+def read_stored_cookie(account_key: str) -> str:
+    try:
+        with open(COOKIE_STORE_PATH, encoding="utf-8") as store_file:
+            store_data = json.load(store_file)
+    except (OSError, ValueError):
+        return ""
+
+    account_entry = store_data.get(account_key)
+    if not isinstance(account_entry, dict):
+        return ""
+    return str(account_entry.get("cookie", "")).strip()
+
+
+def write_stored_cookie(account_key: str, cookie: str) -> None:
+    store_data: dict[str, Any] = {}
+    try:
+        with open(COOKIE_STORE_PATH, encoding="utf-8") as store_file:
+            existing_data = json.load(store_file)
+            if isinstance(existing_data, dict):
+                store_data = existing_data
+    except (OSError, ValueError):
+        pass
+
+    store_data[account_key] = {
+        "cookie": cookie,
+        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        with open(COOKIE_STORE_PATH, "w", encoding="utf-8") as store_file:
+            json.dump(store_data, store_file, ensure_ascii=False, indent=2)
+    except OSError as error:
+        print(f"[Cookie存储] 写入失败：{error}")
+
+
+def remove_stored_cookie(account_key: str) -> None:
+    try:
+        with open(COOKIE_STORE_PATH, encoding="utf-8") as store_file:
+            store_data = json.load(store_file)
+    except (OSError, ValueError):
+        return
+
+    if account_key not in store_data:
+        return
+    store_data.pop(account_key)
+    try:
+        with open(COOKIE_STORE_PATH, "w", encoding="utf-8") as store_file:
+            json.dump(store_data, store_file, ensure_ascii=False, indent=2)
+    except OSError as error:
+        print(f"[Cookie存储] 清理失败：{error}")
+
+
 def read_cached_host() -> str | None:
     try:
         with open(DOMAIN_CACHE_PATH, encoding="utf-8") as cache_file:
@@ -272,6 +336,19 @@ class SxsyCheckinClient:
             }
         )
 
+    def _storage_key(self) -> str:
+        """本地 Cookie 存储用的稳定 key。
+
+        有邮箱的账号用邮箱；纯 Cookie 账号用 Cookie 内容的 SHA-256 前 12 位，
+        避免多个纯 Cookie 账号共用 "Cookie 账号" 互相覆盖。
+        """
+        if self.configuration.email:
+            return self.configuration.email
+        cookie_digest = hashlib.sha256(
+            self.configuration.cookie.encode("utf-8"),
+        ).hexdigest()[:12]
+        return f"cookie:{cookie_digest}"
+
     def checkin(self, account_number: int) -> CheckinResult:
         account_label = self.configuration.label
         try:
@@ -337,21 +414,39 @@ class SxsyCheckinClient:
             self.session.close()
 
     def _authenticate(self) -> tuple[bool, str, str]:
-        if self.configuration.cookie:
-            load_cookie_header(self.session, self.configuration.cookie)
+        account_key = self._storage_key()
+        stored_cookie = read_stored_cookie(account_key)
+        cookie_candidates = [
+            ("本地存储", stored_cookie),
+            ("环境变量", self.configuration.cookie),
+        ]
+
+        for cookie_source, cookie_value in cookie_candidates:
+            if not cookie_value:
+                continue
+            load_cookie_header(self.session, cookie_value)
             if self._is_session_valid():
+                if cookie_source == "本地存储":
+                    print("[登录] 本地存储 Cookie 有效")
                 return True, "Cookie", ""
-            print("[登录] Cookie 已失效")
-            if not self.configuration.email or not self.configuration.password:
-                return False, "Cookie", "Cookie 已失效且未配置账号密码"
+            print(f"[登录] {cookie_source} Cookie 已失效")
+            if cookie_source == "本地存储":
+                remove_stored_cookie(account_key)
+            self.session.cookies.clear()
 
         if not self.configuration.email or not self.configuration.password:
-            return False, "未配置", "未配置 Cookie，也未配置完整账号密码"
+            return False, "Cookie", "Cookie 已失效且未配置账号密码"
         if not self.ocr_key:
             return False, "账号密码", "账密登录需要配置 OCR_KEY"
 
         self.session.cookies.clear()
-        return self._login_with_password()
+        login_success, login_method, login_message = self._login_with_password()
+        if login_success:
+            session_cookie = session_cookie_header(self.session)
+            if session_cookie:
+                write_stored_cookie(account_key, session_cookie)
+                print("[Cookie存储] 已保存最新 Cookie")
+        return login_success, login_method, login_message
 
     def _is_session_valid(self) -> bool:
         response = self.session.get(
@@ -520,6 +615,12 @@ class SxsyCheckinClient:
             status="失败",
             message=message,
         )
+
+
+def session_cookie_header(session: requests.Session) -> str:
+    return "; ".join(
+        f"{cookie.name}={cookie.value}" for cookie in session.cookies
+    )
 
 
 def load_cookie_header(session: requests.Session, cookie_header: str) -> None:

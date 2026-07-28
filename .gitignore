@@ -3,3 +3,4 @@ qinglong/
 __pycache__/
 .DS_Store
 AGENTS.md
+scripts_data/
