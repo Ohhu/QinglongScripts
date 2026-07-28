@@ -38,6 +38,8 @@ DEFAULT_ENTRY_HOSTNAME = "www.soushu2035.com"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
 MAX_DISCOVERY_HOPS = 10
+DEFAULT_HTML_ENCODING = "utf-8"
+FALLBACK_HTTP_ENCODINGS = {"iso-8859-1", "latin-1"}
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -140,6 +142,47 @@ def parse_discovery_page(page_text: str) -> DiscoveryPageParser:
     return parser
 
 
+def decode_html_response(response: requests.Response) -> str:
+    """按响应头或 HTML meta 声明解码，避免无 charset 时中文被按 Latin-1 解析。"""
+    candidate_encodings: list[str] = []
+
+    response_encoding = response.encoding
+    if (
+        response_encoding
+        and response_encoding.lower() not in FALLBACK_HTTP_ENCODINGS
+    ):
+        candidate_encodings.append(response_encoding)
+
+    document_prefix = response.content[:4096]
+    meta_charset_match = re.search(
+        br'<meta[^>]+charset\s*=\s*["\']?\s*([a-zA-Z0-9._-]+)',
+        document_prefix,
+        re.IGNORECASE,
+    )
+    if meta_charset_match:
+        candidate_encodings.append(
+            meta_charset_match.group(1).decode("ascii", errors="ignore"),
+        )
+
+    if response.apparent_encoding:
+        candidate_encodings.append(response.apparent_encoding)
+    candidate_encodings.append(DEFAULT_HTML_ENCODING)
+
+    attempted_encodings: set[str] = set()
+    for candidate_encoding in candidate_encodings:
+        normalized_encoding = candidate_encoding.strip().lower()
+        if not normalized_encoding or normalized_encoding in attempted_encodings:
+            continue
+
+        attempted_encodings.add(normalized_encoding)
+        try:
+            return response.content.decode(candidate_encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    return response.content.decode(DEFAULT_HTML_ENCODING, errors="replace")
+
+
 def extract_forum_hostname(
     parser: DiscoveryPageParser,
     current_url: str,
@@ -209,7 +252,7 @@ def discover_forum_hostname(
 
             last_status_code = response.status_code
             current_url = response.url
-            parser = parse_discovery_page(response.text)
+            parser = parse_discovery_page(decode_html_response(response))
 
             forum_hostname = extract_forum_hostname(parser, current_url)
             if forum_hostname:
