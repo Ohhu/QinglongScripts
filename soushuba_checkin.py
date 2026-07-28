@@ -26,6 +26,7 @@ import time
 import urllib3
 from dataclasses import dataclass, field
 from datetime import datetime
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -36,6 +37,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 DEFAULT_ENTRY_HOSTNAME = "www.soushu2035.com"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
+MAX_DISCOVERY_HOPS = 10
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -43,16 +45,6 @@ USER_AGENT = (
     "Chrome/126.0.0.0 Safari/537.36"
 )
 
-# meta refresh: <meta http-equiv="refresh" content="5; url=http://...">
-META_REFRESH_PATTERN = re.compile(
-    r"<meta[^>]+http-equiv=['\"]refresh['\"][^>]+content=['\"]([^'\"]*)['\"]",
-    re.IGNORECASE,
-)
-# 页面里文本为「搜书吧」的链接
-SOUSHUBA_LINK_PATTERN = re.compile(
-    r"<a[^>]+href=['\"]([^'\"]+)['\"][^>]*>\s*搜书吧\s*</a>",
-    re.IGNORECASE,
-)
 # Discuz! formhash
 FORMHASH_PATTERN = re.compile(
     r'<input\s+type="hidden"\s+name="formhash"\s+value="([^"]+)"',
@@ -97,42 +89,143 @@ class LoginResult:
         return "\n".join(lines)
 
 
+class DiscoveryPageParser(HTMLParser):
+    """提取导航页中的 meta refresh 和链接，避免依赖固定属性顺序。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta_refresh_contents: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self.current_link_href: str | None = None
+        self.current_link_text_parts: list[str] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        normalized_attributes = {
+            name.lower(): value or ""
+            for name, value in attrs
+        }
+
+        if tag.lower() == "meta":
+            http_equiv = normalized_attributes.get("http-equiv", "").lower()
+            refresh_content = normalized_attributes.get("content", "")
+            if http_equiv == "refresh" and refresh_content:
+                self.meta_refresh_contents.append(refresh_content)
+
+        if tag.lower() == "a":
+            self.current_link_href = normalized_attributes.get("href")
+            self.current_link_text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self.current_link_href is not None:
+            self.current_link_text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or self.current_link_href is None:
+            return
+
+        link_text = " ".join(self.current_link_text_parts)
+        link_text = re.sub(r"\s+", " ", link_text).strip()
+        self.links.append((self.current_link_href, link_text))
+        self.current_link_href = None
+        self.current_link_text_parts = []
+
+
+def parse_discovery_page(page_text: str) -> DiscoveryPageParser:
+    parser = DiscoveryPageParser()
+    parser.feed(page_text)
+    return parser
+
+
+def extract_forum_hostname(
+    parser: DiscoveryPageParser,
+    current_url: str,
+) -> str | None:
+    for link_href, link_text in parser.links:
+        if "搜书吧" not in link_text:
+            continue
+
+        resolved_url = urljoin(current_url, link_href)
+        parsed_url = urlsplit(resolved_url)
+        if parsed_url.scheme in {"http", "https"} and parsed_url.hostname:
+            return parsed_url.hostname
+
+    return None
+
+
+def extract_meta_refresh_url(
+    parser: DiscoveryPageParser,
+    current_url: str,
+) -> str | None:
+    for refresh_content in parser.meta_refresh_contents:
+        redirect_match = re.search(
+            r"(?:^|;)\s*url\s*=\s*(.+?)\s*$",
+            refresh_content,
+            re.IGNORECASE,
+        )
+        if not redirect_match:
+            continue
+
+        redirect_url = redirect_match.group(1).strip("'\"")
+        if redirect_url:
+            return urljoin(current_url, redirect_url)
+
+    return None
+
+
 def discover_forum_hostname(
     entry_hostname: str,
     timeout_seconds: float,
 ) -> str:
     """跟随 meta refresh 跳转，直到找到「搜书吧」链接，返回其 hostname。"""
     current_url = f"http://{entry_hostname}"
-    max_redirects = 5
+    last_status_code: int | None = None
 
-    for _ in range(max_redirects):
-        response = requests.get(
-            current_url,
-            timeout=timeout_seconds,
-            verify=False,
-            allow_redirects=True,
+    with requests.Session() as discovery_session:
+        discovery_session.headers.update(
+            {
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "User-Agent": USER_AGENT,
+            }
         )
-        page_text = response.text
 
-        link_match = SOUSHUBA_LINK_PATTERN.search(page_text)
-        if link_match:
-            hostname = urlsplit(link_match.group(1)).hostname
-            if hostname:
-                return hostname
+        for hop_number in range(1, MAX_DISCOVERY_HOPS + 1):
+            try:
+                response = discovery_session.get(
+                    current_url,
+                    timeout=timeout_seconds,
+                    verify=False,
+                    allow_redirects=True,
+                )
+            except requests.RequestException as error:
+                raise ValueError(
+                    f"域名发现第 {hop_number} 跳请求失败："
+                    f"{describe_request_error(error)}（{current_url}）",
+                ) from error
 
-        refresh_match = META_REFRESH_PATTERN.search(page_text)
-        if refresh_match:
-            content = refresh_match.group(1)
-            if "url=" in content.lower():
-                redirect_url = content.split("url=", 1)[1].strip()
-                current_url = urljoin(current_url, redirect_url)
+            last_status_code = response.status_code
+            current_url = response.url
+            parser = parse_discovery_page(response.text)
+
+            forum_hostname = extract_forum_hostname(parser, current_url)
+            if forum_hostname:
+                return forum_hostname
+
+            refresh_url = extract_meta_refresh_url(parser, current_url)
+            if refresh_url:
+                current_url = refresh_url
                 continue
 
-        break
+            break
 
     raise ValueError(
         f"未能从入口域名 {entry_hostname} 发现搜书吧真实域名，"
-        "请更新 SOUSHUBA_HOSTNAME 环境变量",
+        f"最后访问 {current_url}（HTTP {last_status_code or '未知'}）；"
+        "请检查导航页结构或更新 SOUSHUBA_HOSTNAME 环境变量",
     )
 
 
