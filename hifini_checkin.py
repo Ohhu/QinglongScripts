@@ -11,21 +11,24 @@ new Env('HiFi 音乐站签到')
                         仅 Cookie：域名|Cookie
                         仅账号密码：域名||用户名|密码
                         hifiii.com 当前强制滑块，密码回退通常会失败，应优先维护 Cookie。
-  HIFI_NOTIFY           是否发送青龙面板系统通知，默认为 true。
+  HIFI_NOTIFY           是否发送通知，默认为 true。
   HIFI_PRIVACY_MODE     日志和通知中是否对用户名脱敏，默认为 true。
   HIFI_USER_AGENT       可选。覆盖默认浏览器 User-Agent。
+  TG_NOTIFY_CONFIG      可选。统一 Telegram 配置：BotToken|ChatID|APIHost；
+                        配置后使用 HTML 直发，失败回退青龙纯文本通知。
   TASK_RANDOM_SIGNIN    是否启用启动前随机延迟，默认为 true（所有任务共用）。
   TASK_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600（所有任务共用）。
   TASK_TIMEOUT          单次请求超时秒数，默认为 20（所有任务共用）。
   TASK_ACCOUNT_DELAY    多账号之间的等待秒数，默认为 3（所有任务共用）。
 
-通知复用青龙注入的 QLAPI.systemNotify。内容使用 Telegram Markdown 风格排版。
+通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
 
 from __future__ import annotations
 
 import builtins
 import hashlib
+import html
 import json
 import os
 import random
@@ -636,66 +639,144 @@ def wait_with_countdown(delay_seconds: float, task_name: str) -> None:
         remaining_seconds -= sleep_seconds
 
 
-def markdown_code(value: Any) -> str:
-    safe_value = (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace("`", "\\`")
-        .replace("\n", " ")
-    )
-    return f"`{safe_value}`"
+def escape_html_text(value: Any) -> str:
+    return html.escape(str(value).replace("\n", " "), quote=False)
 
 
-def markdown_text(value: Any) -> str:
-    text = str(value).replace("\n", " ")
-    return re.sub(r"([\\_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
+def html_code(value: Any) -> str:
+    return f"<code>{escape_html_text(value)}</code>"
 
 
-def build_markdown_notification(
+def build_notification_content(
     results: list[CheckinResult],
     configuration_errors: list[str],
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     successful_count = sum(result.success for result in results)
     failed_count = len(results) - successful_count
     status_icon = "✅" if failed_count == 0 and successful_count > 0 else "⚠️"
-    title = f"🎵 HiFi 签到 | {status_icon} {successful_count}/{len(results)}"
+    title = f"🎵 HiFi 签到 {status_icon} {successful_count}/{len(results)}"
 
-    sections = [
-        "🎵 *HiFi 音乐站每日签到*",
+    html_sections = [
+        "🎵 <b>HiFi 音乐站每日签到</b>",
         "\n".join(
             [
-                "📊 *执行概览*",
-                f"• 成功：{markdown_code(successful_count)}",
-                f"• 失败：{markdown_code(failed_count)}",
-                f"• 时间：{markdown_code(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}",
+                "📊 <b>执行概览</b>",
+                f"• 成功：{html_code(successful_count)}",
+                f"• 失败：{html_code(failed_count)}",
+                f"• 时间：{html_code(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}",
+            ]
+        ),
+    ]
+    plain_sections = [
+        "🎵 HiFi 音乐站每日签到",
+        "\n".join(
+            [
+                "📊 执行概览",
+                f"• 成功：{successful_count}",
+                f"• 失败：{failed_count}",
+                f"• 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             ]
         ),
     ]
 
     for result in results:
         result_icon = "✅" if result.success else "❌"
-        account_lines = [
-            f"{result_icon} *账号 {result.account_number} · "
-            f"{markdown_text(result.account_label)}*",
-            f"• 站点：{markdown_code(result.domain)}",
-            f"• 登录：{markdown_code(result.login_method)}",
-            f"• 状态：*{markdown_text(result.status)}*",
-            f"• 说明：{markdown_text(result.message)}",
+        html_account_lines = [
+            f"{result_icon} <b>账号 {result.account_number} · "
+            f"{escape_html_text(result.account_label)}</b>",
+            f"• 站点：{html_code(result.domain)}",
+            f"• 登录：{html_code(result.login_method)}",
+            f"• 状态：<b>{escape_html_text(result.status)}</b>",
+            f"• 说明：{escape_html_text(result.message)}",
+        ]
+        plain_account_lines = [
+            f"{result_icon} 账号 {result.account_number} · {result.account_label}",
+            f"• 站点：{result.domain}",
+            f"• 登录：{result.login_method}",
+            f"• 状态：{result.status}",
+            f"• 说明：{result.message}",
         ]
         for detail_name, detail_value in result.details.items():
-            account_lines.append(
-                f"• {markdown_text(detail_name)}：{markdown_code(detail_value)}",
+            html_account_lines.append(
+                f"• {escape_html_text(detail_name)}：{html_code(detail_value)}",
             )
-        sections.append("\n".join(account_lines))
+            plain_account_lines.append(
+                f"• {detail_name}：{detail_value}",
+            )
+        html_sections.append("\n".join(html_account_lines))
+        plain_sections.append("\n".join(plain_account_lines))
 
     if configuration_errors:
-        error_lines = ["⚙️ *配置提示*"]
-        error_lines.extend(
-            f"• {markdown_text(error)}" for error in configuration_errors
+        html_error_lines = ["⚙️ <b>配置提示</b>"]
+        html_error_lines.extend(
+            f"• {escape_html_text(error)}" for error in configuration_errors
         )
-        sections.append("\n".join(error_lines))
+        html_sections.append("\n".join(html_error_lines))
 
-    return title, "\n\n".join(sections)
+        plain_error_lines = ["⚙️ 配置提示"]
+        plain_error_lines.extend(f"• {error}" for error in configuration_errors)
+        plain_sections.append("\n".join(plain_error_lines))
+
+    return title, "\n\n".join(html_sections), "\n\n".join(plain_sections)
+
+
+def read_telegram_notify_configuration() -> tuple[str, str, str] | None:
+    raw_configuration = os.getenv("TG_NOTIFY_CONFIG", "").strip()
+    if not raw_configuration:
+        return None
+
+    configuration_parts = raw_configuration.split("|", maxsplit=2)
+    if len(configuration_parts) != 3:
+        print("[通知] TG_NOTIFY_CONFIG 格式错误，应为 BotToken|ChatID|APIHost")
+        return None
+
+    bot_token, chat_id, api_host = (part.strip() for part in configuration_parts)
+    if not bot_token or not chat_id:
+        print("[通知] TG_NOTIFY_CONFIG 缺少 BotToken 或 ChatID")
+        return None
+
+    api_host = (api_host or "https://api.telegram.org").rstrip("/")
+    return bot_token, chat_id, api_host
+
+
+def send_telegram_html_notification(content: str, timeout_seconds: float) -> bool:
+    notify_configuration = read_telegram_notify_configuration()
+    if notify_configuration is None:
+        return False
+
+    bot_token, chat_id, api_host = notify_configuration
+    try:
+        response = requests.post(
+            f"{api_host}/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": content,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=timeout_seconds,
+        )
+    except requests.RequestException as error:
+        print(f"[通知] Telegram HTML 直发网络错误：{describe_request_error(error)}")
+        return False
+
+    try:
+        response_data = response.json()
+    except ValueError:
+        print(f"[通知] Telegram HTML 直发返回异常：HTTP {response.status_code}")
+        return False
+
+    if response.status_code != 200 or not response_data.get("ok"):
+        error_description = str(response_data.get("description", "未知错误"))
+        print(f"[通知] Telegram HTML 直发失败：{error_description}")
+        return False
+
+    message_result = response_data.get("result", {})
+    if isinstance(message_result, dict):
+        print(f"[通知] Telegram HTML 直发成功，message_id={message_result.get('message_id')}")
+    else:
+        print("[通知] Telegram HTML 直发成功")
+    return True
 
 
 def send_system_notification(title: str, content: str) -> bool:
@@ -716,6 +797,18 @@ def send_system_notification(title: str, content: str) -> bool:
 
     print(f"[通知] 面板系统通知调用完成：{response}")
     return True
+
+
+def send_notifications(
+    title: str,
+    html_content: str,
+    plain_content: str,
+    timeout_seconds: float,
+) -> None:
+    if send_telegram_html_notification(html_content, timeout_seconds):
+        return
+    print("[通知] 使用青龙纯文本通知回退")
+    send_system_notification(title, plain_content)
 
 
 def print_result(result: CheckinResult) -> None:
@@ -791,15 +884,24 @@ def main() -> int:
             print(f"等待 {account_delay_seconds:g} 秒后处理下一个账号")
             time.sleep(account_delay_seconds)
 
-    notification_title, notification_content = build_markdown_notification(
+    (
+        notification_title,
+        html_notification_content,
+        plain_notification_content,
+    ) = build_notification_content(
         results,
         configuration_errors,
     )
     print("\n==== HiFi 音乐站每日签到汇总 ====")
-    print(notification_content)
+    print(plain_notification_content)
 
     if notification_enabled:
-        send_system_notification(notification_title, notification_content)
+        send_notifications(
+            title=notification_title,
+            html_content=html_notification_content,
+            plain_content=plain_notification_content,
+            timeout_seconds=timeout_seconds,
+        )
     else:
         print("[通知] HIFI_NOTIFY 已关闭，跳过通知")
 
