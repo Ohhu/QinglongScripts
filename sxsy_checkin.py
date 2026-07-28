@@ -6,8 +6,9 @@ new Env('尚香书苑签到')
 
 环境变量：
   SXSY_ACCOUNTS        必填。每行一个账号，格式如下：
-                         邮箱|密码          账密登录（需要 OCR）
-                         邮箱|密码|Cookie   Cookie 优先，失效回退账密
+                         用户名|密码         账密登录（需要 OCR）
+                         用户名|密码|Cookie  Cookie 优先，失效回退账密
+                         第一列支持用户名或邮箱，自动识别（含 @ 视为邮箱）。
                          Cookie 优先级最高：整行不含 | 时视为纯 Cookie。
   OCR_KEY              账密登录或自动域名发现时必填。EasyOCR 云端
                        访问密钥（console.easyocr.org 创建，eocr_ 开头），
@@ -93,14 +94,19 @@ USER_AGENT = (
 
 @dataclass(frozen=True)
 class AccountConfiguration:
-    email: str = ""
+    identifier: str = ""
     password: str = ""
     cookie: str = ""
 
     @property
+    def login_field(self) -> str:
+        """Discuz 登录字段：含 @ 视为邮箱，否则按用户名登录。"""
+        return "email" if "@" in self.identifier else "username"
+
+    @property
     def label(self) -> str:
-        if self.email:
-            return self.email
+        if self.identifier:
+            return self.identifier
         return "Cookie 账号"
 
 
@@ -131,20 +137,20 @@ def parse_account_configurations(
             continue
         if len(parts) == 2 and all(parts):
             configurations.append(
-                AccountConfiguration(email=parts[0], password=parts[1]),
+                AccountConfiguration(identifier=parts[0], password=parts[1]),
             )
             continue
         if len(parts) == 3 and parts[0] and parts[1] and parts[2]:
             configurations.append(
                 AccountConfiguration(
-                    email=parts[0],
+                    identifier=parts[0],
                     password=parts[1],
                     cookie=parts[2],
                 ),
             )
             continue
         configuration_errors.append(
-            f"第 {line_number} 行账号格式无效，应为 邮箱|密码 或 邮箱|密码|Cookie",
+            f"第 {line_number} 行账号格式无效，应为 用户名|密码 或 用户名|密码|Cookie",
         )
 
     return configurations, configuration_errors
@@ -339,11 +345,12 @@ class SxsyCheckinClient:
     def _storage_key(self) -> str:
         """本地 Cookie 存储用的稳定 key。
 
-        有邮箱的账号用邮箱；纯 Cookie 账号用 Cookie 内容的 SHA-256 前 12 位，
-        避免多个纯 Cookie 账号共用 "Cookie 账号" 互相覆盖。
+        有登录标识的账号用标识本身（邮箱或用户名）；纯 Cookie 账号用
+        Cookie 内容的 SHA-256 前 12 位，避免多个纯 Cookie 账号共用
+        "Cookie 账号" 互相覆盖。
         """
-        if self.configuration.email:
-            return self.configuration.email
+        if self.configuration.identifier:
+            return self.configuration.identifier
         cookie_digest = hashlib.sha256(
             self.configuration.cookie.encode("utf-8"),
         ).hexdigest()[:12]
@@ -434,7 +441,7 @@ class SxsyCheckinClient:
                 remove_stored_cookie(account_key)
             self.session.cookies.clear()
 
-        if not self.configuration.email or not self.configuration.password:
+        if not self.configuration.identifier or not self.configuration.password:
             return False, "Cookie", "Cookie 已失效且未配置账号密码"
         if not self.ocr_key:
             return False, "账号密码", "账密登录需要配置 OCR_KEY"
@@ -490,8 +497,8 @@ class SxsyCheckinClient:
         login_payload = {
             "formhash": form_hash,
             "referer": f"https://{self.host}/",
-            "loginfield": "email",
-            "username": self.configuration.email,
+            "loginfield": self.configuration.login_field,
+            "username": self.configuration.identifier,
             "password": self.configuration.password,
             "questionid": "0",
             "answer": "",
