@@ -30,6 +30,7 @@ EasyOCR 云端识别最新域名，再失败则使用内置默认域名。
 Cookie 持久化：账密登录成功后把最新 Cookie 存入青龙数据目录
 （默认 /ql/data/scripts_data/sxsy_cookies.json），之后运行优先用本地
 存储的 Cookie，失效后自动清理并依次回退环境变量 Cookie、账密登录。
+旧版 Cookie 文件会自动迁移到统一的多账号存储结构。
 
 通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
@@ -39,7 +40,6 @@ from __future__ import annotations
 import builtins
 import hashlib
 import html
-import json
 import os
 import random
 import re
@@ -51,6 +51,14 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
 import requests
+
+from comm.cookie_store import CookieStore
+from comm.task_runtime import (
+    apply_startup_random_delay,
+    load_task_runtime_settings,
+    read_boolean_environment,
+    wait_between_accounts,
+)
 
 
 EASYOCR_API_URL = "https://console.easyocr.org/api/ocr"
@@ -72,7 +80,7 @@ except OSError as error:
     ) from error
 
 DOMAIN_CACHE_PATH = os.path.join(QINGLONG_DATA_DIR, "sxsy_last_host")
-COOKIE_STORE_PATH = os.path.join(QINGLONG_DATA_DIR, "sxsy_cookies.json")
+COOKIE_STORE = CookieStore("sxsy_cookies")
 
 HOST_PATTERN = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.IGNORECASE)
 FORM_HASH_PATTERN = re.compile(r'name="formhash"\s+value="([a-zA-Z0-9]{8})"')
@@ -231,57 +239,6 @@ def recognize_image_with_ocr(
     if remaining_quota is not None:
         print(f"[OCR] 识别成功：{recognized_text!r}（剩余额度 {remaining_quota}）")
     return recognized_text
-
-
-def read_stored_cookie(account_key: str) -> str:
-    try:
-        with open(COOKIE_STORE_PATH, encoding="utf-8") as store_file:
-            store_data = json.load(store_file)
-    except (OSError, ValueError):
-        return ""
-
-    account_entry = store_data.get(account_key)
-    if not isinstance(account_entry, dict):
-        return ""
-    return str(account_entry.get("cookie", "")).strip()
-
-
-def write_stored_cookie(account_key: str, cookie: str) -> None:
-    store_data: dict[str, Any] = {}
-    try:
-        with open(COOKIE_STORE_PATH, encoding="utf-8") as store_file:
-            existing_data = json.load(store_file)
-            if isinstance(existing_data, dict):
-                store_data = existing_data
-    except (OSError, ValueError):
-        pass
-
-    store_data[account_key] = {
-        "cookie": cookie,
-        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    try:
-        with open(COOKIE_STORE_PATH, "w", encoding="utf-8") as store_file:
-            json.dump(store_data, store_file, ensure_ascii=False, indent=2)
-    except OSError as error:
-        print(f"[Cookie存储] 写入失败：{error}")
-
-
-def remove_stored_cookie(account_key: str) -> None:
-    try:
-        with open(COOKIE_STORE_PATH, encoding="utf-8") as store_file:
-            store_data = json.load(store_file)
-    except (OSError, ValueError):
-        return
-
-    if account_key not in store_data:
-        return
-    store_data.pop(account_key)
-    try:
-        with open(COOKIE_STORE_PATH, "w", encoding="utf-8") as store_file:
-            json.dump(store_data, store_file, ensure_ascii=False, indent=2)
-    except OSError as error:
-        print(f"[Cookie存储] 清理失败：{error}")
 
 
 def read_cached_host() -> str | None:
@@ -506,7 +463,7 @@ class SxsyCheckinClient:
 
     def _authenticate(self) -> tuple[bool, str, str]:
         account_key = self._storage_key()
-        stored_cookie = read_stored_cookie(account_key)
+        stored_cookie = COOKIE_STORE.read(account_key)
         cookie_candidates = [
             ("本地存储", stored_cookie),
             ("环境变量", self.configuration.cookie),
@@ -519,10 +476,13 @@ class SxsyCheckinClient:
             if self._is_session_valid():
                 if cookie_source == "本地存储":
                     print("[登录] 本地存储 Cookie 有效")
+                refreshed_cookie = session_cookie_header(self.session)
+                if refreshed_cookie:
+                    COOKIE_STORE.write(account_key, refreshed_cookie)
                 return True, "Cookie", ""
             print(f"[登录] {cookie_source} Cookie 已失效")
             if cookie_source == "本地存储":
-                remove_stored_cookie(account_key)
+                COOKIE_STORE.remove(account_key)
             self.session.cookies.clear()
 
         if not self.configuration.identifier or not self.configuration.password:
@@ -535,7 +495,7 @@ class SxsyCheckinClient:
         if login_success:
             session_cookie = session_cookie_header(self.session)
             if session_cookie:
-                write_stored_cookie(account_key, session_cookie)
+                COOKIE_STORE.write(account_key, session_cookie)
                 print("[Cookie存储] 已保存最新 Cookie")
         return login_success, login_method, login_message
 
@@ -851,55 +811,6 @@ def mask_identifier(identifier: str) -> str:
     return f"{masked_local}@{domain_part}" if domain_part else masked_local
 
 
-def read_positive_float_environment(
-    variable_name: str,
-    default_value: float,
-) -> float:
-    raw_value = os.getenv(variable_name, str(default_value)).strip()
-    try:
-        parsed_value = float(raw_value)
-    except ValueError:
-        print(f"[配置] {variable_name}={raw_value!r} 无效，使用默认值 {default_value}")
-        return default_value
-
-    if parsed_value < 0:
-        print(f"[配置] {variable_name} 不能为负数，使用默认值 {default_value}")
-        return default_value
-    return parsed_value
-
-
-def read_boolean_environment(variable_name: str, default_value: bool) -> bool:
-    raw_value = os.getenv(variable_name)
-    if raw_value is None:
-        return default_value
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def format_time_remaining(seconds: float) -> str:
-    total_seconds = int(seconds)
-    if total_seconds <= 0:
-        return "立即执行"
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours}小时{minutes}分{secs}秒"
-    if minutes > 0:
-        return f"{minutes}分{secs}秒"
-    return f"{secs}秒"
-
-
-def wait_with_countdown(delay_seconds: float, task_name: str) -> None:
-    remaining_seconds = delay_seconds
-    while remaining_seconds > 0:
-        print(
-            f"{task_name} 倒计时："
-            f"{format_time_remaining(remaining_seconds)}",
-        )
-        sleep_seconds = 1 if remaining_seconds <= 10 else min(10, remaining_seconds)
-        time.sleep(sleep_seconds)
-        remaining_seconds -= sleep_seconds
-
-
 def send_system_notification(title: str, content: str) -> bool:
     qinglong_api: Any = getattr(builtins, "QLAPI", None)
     if qinglong_api is None:
@@ -1103,26 +1014,18 @@ def main() -> int:
     for configuration_error in configuration_errors:
         print(f"[配置错误] {configuration_error}")
 
-    timeout_seconds = read_positive_float_environment(
-        "TASK_TIMEOUT",
-        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    runtime_settings = load_task_runtime_settings(
+        default_request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        default_account_delay_seconds=DEFAULT_ACCOUNT_DELAY_SECONDS,
     )
-    account_delay_seconds = read_positive_float_environment(
-        "TASK_ACCOUNT_DELAY",
-        DEFAULT_ACCOUNT_DELAY_SECONDS,
-    )
+    timeout_seconds = runtime_settings.request_timeout_seconds
     privacy_mode = read_boolean_environment("SXSY_PRIVACY_MODE", True)
 
-    random_signin_enabled = read_boolean_environment("TASK_RANDOM_SIGNIN", True)
-    if random_signin_enabled:
-        max_random_delay = read_positive_float_environment(
-            "TASK_RANDOM_DELAY_MAX",
-            3600.0,
-        )
-        if max_random_delay > 0:
-            delay_seconds = random.uniform(0, max_random_delay)
-            print(f"🎲 随机延迟：{format_time_remaining(delay_seconds)}")
-            wait_with_countdown(delay_seconds, "尚香书苑签到")
+    apply_startup_random_delay(
+        "尚香书苑签到",
+        runtime_settings,
+        has_work=bool(configurations),
+    )
 
     host, host_resolution_error = resolve_host(ocr_key, timeout_seconds)
     if host_resolution_error:
@@ -1144,10 +1047,11 @@ def main() -> int:
         results.append(result)
         print_result(result)
 
-        has_next_account = account_index < len(configurations)
-        if has_next_account and account_delay_seconds > 0:
-            print(f"等待 {account_delay_seconds:g} 秒后处理下一个账号")
-            time.sleep(account_delay_seconds)
+        wait_between_accounts(
+            account_index,
+            len(configurations),
+            runtime_settings.account_delay_seconds,
+        )
 
     notification_title, html_content, plain_content = build_notification_content(
         results,

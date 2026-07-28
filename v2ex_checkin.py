@@ -22,22 +22,28 @@ from __future__ import annotations
 import builtins
 import html
 import os
-import random
 import re
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 import requests
 
+from comm.task_runtime import (
+    apply_startup_random_delay,
+    load_task_runtime_settings,
+    read_boolean_environment,
+    wait_between_accounts,
+)
+
 
 BASE_URL = "https://www.v2ex.com/"
 MISSION_DAILY_URL = "https://www.v2ex.com/mission/daily"
 MISSION_DAILY_REDEEM_URL = "https://www.v2ex.com/mission/daily/redeem"
 
-DEFAULT_REQUEST_TIMEOUT_SECONDS = 15.0
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
+DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
 DEFAULT_RANDOM_DELAY_MAX_SECONDS = 3600.0
 
 USER_AGENT = (
@@ -253,54 +259,6 @@ def mask_identifier(identifier: str) -> str:
     return f"{identifier[0]}***{identifier[-1]}"
 
 
-def read_positive_float_environment(
-    variable_name: str,
-    default_value: float,
-) -> float:
-    raw_value = os.getenv(variable_name, str(default_value)).strip()
-    try:
-        parsed_value = float(raw_value)
-    except ValueError:
-        print(f"[配置] {variable_name}={raw_value!r} 无效，使用默认值 {default_value}")
-        return default_value
-
-    if parsed_value < 0:
-        print(f"[配置] {variable_name} 不能为负数，使用默认值 {default_value}")
-        return default_value
-    return parsed_value
-
-
-def read_boolean_environment(variable_name: str, default_value: bool) -> bool:
-    raw_value = os.getenv(variable_name)
-    if raw_value is None:
-        return default_value
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def format_time_remaining(seconds: float) -> str:
-    """将秒数格式化为人类可读的时长描述。"""
-    total_seconds = int(seconds)
-    if total_seconds <= 0:
-        return "立即执行"
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours}小时{minutes}分{secs}秒"
-    if minutes > 0:
-        return f"{minutes}分{secs}秒"
-    return f"{secs}秒"
-
-
-def wait_with_countdown(delay_seconds: float, task_name: str) -> None:
-    """随机延迟等待，期间定期打印剩余时间倒计时。"""
-    remaining = delay_seconds
-    while remaining > 0:
-        print(f"{task_name} 倒计时：{format_time_remaining(remaining)}")
-        sleep_seconds = 1 if remaining <= 10 else min(10, remaining)
-        time.sleep(sleep_seconds)
-        remaining -= sleep_seconds
-
-
 def send_system_notification(title: str, content: str) -> bool:
     qinglong_api: Any = getattr(builtins, "QLAPI", None)
     if qinglong_api is None:
@@ -506,22 +464,18 @@ def main() -> int:
     for error in configuration_errors:
         print(f"[配置错误] {error}")
 
-    request_timeout_seconds = read_positive_float_environment(
-        "TASK_TIMEOUT",
-        20.0,
+    runtime_settings = load_task_runtime_settings(
+        default_request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        default_account_delay_seconds=DEFAULT_ACCOUNT_DELAY_SECONDS,
+        default_random_delay_max_seconds=DEFAULT_RANDOM_DELAY_MAX_SECONDS,
     )
+    request_timeout_seconds = runtime_settings.request_timeout_seconds
 
-    # 启动前随机延迟，避免固定时间签到
-    random_signin_enabled = read_boolean_environment("TASK_RANDOM_SIGNIN", True)
-    if random_signin_enabled:
-        max_random_delay = read_positive_float_environment(
-            "TASK_RANDOM_DELAY_MAX",
-            3600.0,
-        )
-        if max_random_delay > 0:
-            delay_seconds = random.uniform(0, max_random_delay)
-            print(f"🎲 随机延迟：{format_time_remaining(delay_seconds)}")
-            wait_with_countdown(delay_seconds, "V2EX签到")
+    apply_startup_random_delay(
+        "V2EX签到",
+        runtime_settings,
+        has_work=bool(cookies),
+    )
 
     results: list[CheckinResult] = []
     for account_index, cookie in enumerate(cookies, start=1):
@@ -538,12 +492,11 @@ def main() -> int:
         results.append(result)
         print_result(result)
 
-        has_next_account = account_index < len(cookies)
-        if has_next_account:
-            account_gap = read_positive_float_environment("TASK_ACCOUNT_DELAY", 3.0)
-            if account_gap > 0:
-                print(f"等待 {account_gap:g} 秒后处理下一个账号")
-                time.sleep(account_gap)
+        wait_between_accounts(
+            account_index,
+            len(cookies),
+            runtime_settings.account_delay_seconds,
+        )
 
     notification_title, html_content, plain_content = build_notification_content(
         results,

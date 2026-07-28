@@ -19,12 +19,17 @@ import builtins
 import html
 from datetime import datetime, timedelta
 
+from comm.task_runtime import (
+    apply_startup_random_delay,
+    load_task_runtime_settings,
+    read_boolean_environment,
+    wait_between_accounts,
+)
+
 # 配置项
 BAIDU_COOKIE = os.environ.get('BAIDU_COOKIE', '')
-random_signin = os.getenv("TASK_RANDOM_SIGNIN", "true").lower() == "true"
-max_random_delay = int(os.getenv("TASK_RANDOM_DELAY_MAX", "3600"))
-privacy_mode = os.getenv("PRIVACY_MODE", "true").lower() == "true"
-task_timeout = int(os.getenv("TASK_TIMEOUT", "20"))
+privacy_mode = read_boolean_environment("PRIVACY_MODE", True)
+task_timeout = 20.0
 
 HEADERS = {
     'Connection': 'keep-alive',
@@ -42,32 +47,6 @@ HEADERS = {
     'Accept-Encoding': 'gzip, deflate',
     'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
 }
-
-def format_time_remaining(seconds):
-    """格式化时间显示"""
-    if seconds <= 0:
-        return "立即执行"
-    hours, minutes = divmod(seconds, 3600)
-    minutes, secs = divmod(minutes, 60)
-    if hours > 0:
-        return f"{hours}小时{minutes}分{secs}秒"
-    elif minutes > 0:
-        return f"{minutes}分{secs}秒"
-    else:
-        return f"{secs}秒"
-
-def wait_with_countdown(delay_seconds, task_name):
-    """带倒计时的随机延迟等待"""
-    if delay_seconds <= 0:
-        return
-    print(f"{task_name} 需要等待 {format_time_remaining(delay_seconds)}")
-    remaining = delay_seconds
-    while remaining > 0:
-        if remaining <= 10 or remaining % 10 == 0:
-            print(f"{task_name} 倒计时: {format_time_remaining(remaining)}")
-        sleep_time = 1 if remaining <= 10 else min(10, remaining)
-        time.sleep(sleep_time)
-        remaining -= sleep_time
 
 def escape_html_text(value):
     return html.escape(str(value).replace("\n", " "), quote=False)
@@ -537,18 +516,16 @@ class BaiduPan:
 
 def main():
     """主程序入口"""
+    global task_timeout
+
     print(f"==== 百度网盘签到开始 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ====")
-    
+
+    runtime_settings = load_task_runtime_settings()
+    task_timeout = runtime_settings.request_timeout_seconds
+
     # 显示配置状态
     print(f"🔒 隐私保护模式: {'已启用' if privacy_mode else '已禁用'}")
-    
-    # 随机延迟（整体延迟）
-    if random_signin:
-        delay_seconds = random.randint(0, max_random_delay)
-        if delay_seconds > 0:
-            print(f"🎲 随机延迟: {format_time_remaining(delay_seconds)}")
-            wait_with_countdown(delay_seconds, "百度网盘签到")
-    
+
     # 获取Cookie配置
     baidu_cookies = BAIDU_COOKIE
     
@@ -566,6 +543,12 @@ def main():
         cookies = [cookie.strip() for cookie in baidu_cookies.split('\n') if cookie.strip()]
     else:
         cookies = [baidu_cookies.strip()]
+
+    apply_startup_random_delay(
+        "百度网盘签到",
+        runtime_settings,
+        has_work=bool(cookies),
+    )
     
     print(f"📝 共发现 {len(cookies)} 个账号")
     
@@ -577,10 +560,11 @@ def main():
         try:
             # 账号间等待
             if index > 0:
-                account_delay = int(os.getenv("TASK_ACCOUNT_DELAY", "3"))
-                if account_delay > 0:
-                    print(f"⏱️  等待 {account_delay} 秒后处理下一个账号...")
-                    time.sleep(account_delay)
+                wait_between_accounts(
+                    index,
+                    total_count,
+                    runtime_settings.account_delay_seconds,
+                )
             
             # 执行签到
             baidu_pan = BaiduPan(cookie, index + 1)

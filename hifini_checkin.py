@@ -21,6 +21,9 @@ new Env('HiFi 音乐站签到')
   TASK_TIMEOUT          单次请求超时秒数，默认为 20（所有任务共用）。
   TASK_ACCOUNT_DELAY    多账号之间的等待秒数，默认为 3（所有任务共用）。
 
+登录成功或 Cookie 验证成功后，会把刷新后的会话保存到
+/ql/data/scripts_data/hifini_cookies.json，后续运行优先复用。
+
 通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
 
@@ -31,10 +34,8 @@ import hashlib
 import html
 import json
 import os
-import random
 import re
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from html import unescape
@@ -43,6 +44,14 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 import urllib3
+
+from comm.cookie_store import CookieStore
+from comm.task_runtime import (
+    apply_startup_random_delay,
+    load_task_runtime_settings,
+    read_boolean_environment,
+    wait_between_accounts,
+)
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -66,6 +75,7 @@ USERNAME_LINK_PATTERN = re.compile(
     r"\s*(.*?)\s*</a>",
     re.IGNORECASE | re.DOTALL,
 )
+COOKIE_STORE = CookieStore("hifini_cookies")
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,15 @@ class HifiCheckinClient:
                 "User-Agent": user_agent,
             }
         )
+
+    def _storage_key(self) -> str:
+        account_identifier = self.configuration.username
+        if not account_identifier:
+            cookie_digest = hashlib.sha256(
+                self.configuration.cookie.encode("utf-8"),
+            ).hexdigest()[:16]
+            account_identifier = f"cookie:{cookie_digest}"
+        return f"{urlsplit(self.base_url).netloc}|{account_identifier}"
 
     def checkin(self, account_number: int) -> CheckinResult:
         account_label = self._configured_account_label()
@@ -222,29 +241,44 @@ class HifiCheckinClient:
             self.session.close()
 
     def _authenticate(self) -> AuthenticationResult:
-        cookie_failure_message = ""
+        account_key = self._storage_key()
+        stored_cookie = COOKIE_STORE.read(account_key)
+        cookie_failure_messages: list[str] = []
 
-        if self.configuration.cookie:
-            load_cookie_header(self.session, self.configuration.cookie)
+        cookie_candidates = [
+            ("本地 Cookie", stored_cookie),
+            ("环境变量 Cookie", self.configuration.cookie),
+        ]
+        for login_method, cookie_value in cookie_candidates:
+            if not cookie_value:
+                continue
+            load_cookie_header(self.session, cookie_value)
             authenticated, username, message = self._verify_session()
             if authenticated:
+                refreshed_cookie = export_session_cookie_header(self.session)
+                if refreshed_cookie:
+                    COOKIE_STORE.write(account_key, refreshed_cookie)
                 return AuthenticationResult(
                     success=True,
-                    login_method="Cookie",
+                    login_method=login_method,
                     username=username,
                     message="Cookie 登录状态有效",
                 )
             cookie_failure_message = message or "Cookie 已失效"
-            print(f"[登录] Cookie 不可用：{cookie_failure_message}")
+            cookie_failure_messages.append(
+                f"{login_method} 不可用（{cookie_failure_message}）",
+            )
+            print(f"[登录] {login_method} 不可用：{cookie_failure_message}")
+            if login_method == "本地 Cookie" and "已失效" in cookie_failure_message:
+                COOKIE_STORE.remove(account_key)
+            self.session.cookies.clear()
 
         if not self.configuration.username or not self.configuration.password:
-            if self.configuration.cookie:
+            if cookie_failure_messages:
                 return AuthenticationResult(
                     success=False,
                     login_method="Cookie",
-                    message=(
-                        f"{cookie_failure_message}；未配置账号密码，无法回退登录"
-                    ),
+                    message=f"{'；'.join(cookie_failure_messages)}；未配置账号密码",
                 )
             return AuthenticationResult(
                 success=False,
@@ -255,12 +289,19 @@ class HifiCheckinClient:
         self.session.cookies.clear()
         self._visit_homepage()
         login_result = self._login_with_password()
-        if not login_result.success and cookie_failure_message:
+        if login_result.success:
+            refreshed_cookie = export_session_cookie_header(self.session)
+            if refreshed_cookie:
+                COOKIE_STORE.write(account_key, refreshed_cookie)
+                print("[Cookie存储] 已保存最新 Cookie")
+            return login_result
+
+        if cookie_failure_messages:
             return AuthenticationResult(
                 success=False,
                 login_method=login_result.login_method,
                 message=(
-                    f"Cookie 不可用（{cookie_failure_message}）；"
+                    f"{'；'.join(cookie_failure_messages)}；"
                     f"账号密码回退失败（{login_result.message}）"
                 ),
             )
@@ -450,6 +491,16 @@ def load_cookie_header(session: requests.Session, cookie_header: str) -> None:
             session.cookies.set(cookie_name, cookie_value.strip())
 
 
+def export_session_cookie_header(session: requests.Session) -> str:
+    cookie_values: dict[str, str] = {}
+    for cookie in session.cookies:
+        cookie_values[cookie.name] = cookie.value
+    return "; ".join(
+        f"{cookie_name}={cookie_value}"
+        for cookie_name, cookie_value in cookie_values.items()
+    )
+
+
 def parse_json_response(response_text: str) -> dict[str, Any]:
     stripped_response = response_text.strip()
     try:
@@ -588,55 +639,6 @@ def mask_identifier(identifier: str) -> str:
     if len(identifier) == 2:
         return f"{identifier[0]}*"
     return f"{identifier[0]}***{identifier[-1]}"
-
-
-def read_boolean_environment(variable_name: str, default_value: bool) -> bool:
-    raw_value = os.getenv(variable_name)
-    if raw_value is None:
-        return default_value
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def read_positive_float_environment(
-    variable_name: str,
-    default_value: float,
-) -> float:
-    raw_value = os.getenv(variable_name, str(default_value)).strip()
-    try:
-        parsed_value = float(raw_value)
-    except ValueError:
-        print(f"[配置] {variable_name}={raw_value!r} 无效，使用默认值 {default_value}")
-        return default_value
-
-    if parsed_value < 0:
-        print(f"[配置] {variable_name} 不能为负数，使用默认值 {default_value}")
-        return default_value
-    return parsed_value
-
-
-def format_time_remaining(seconds: float) -> str:
-    total_seconds = int(seconds)
-    if total_seconds <= 0:
-        return "立即执行"
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, remaining_seconds = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours}小时{minutes}分{remaining_seconds}秒"
-    if minutes > 0:
-        return f"{minutes}分{remaining_seconds}秒"
-    return f"{remaining_seconds}秒"
-
-
-def wait_with_countdown(delay_seconds: float, task_name: str) -> None:
-    remaining_seconds = delay_seconds
-    while remaining_seconds > 0:
-        print(
-            f"{task_name} 倒计时："
-            f"{format_time_remaining(remaining_seconds)}",
-        )
-        sleep_seconds = 1 if remaining_seconds <= 10 else min(10, remaining_seconds)
-        time.sleep(sleep_seconds)
-        remaining_seconds -= sleep_seconds
 
 
 def escape_html_text(value: Any) -> str:
@@ -832,30 +834,23 @@ def main() -> int:
     for configuration_error in configuration_errors:
         print(f"[配置错误] {configuration_error}")
 
-    timeout_seconds = read_positive_float_environment(
-        "TASK_TIMEOUT",
-        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    runtime_settings = load_task_runtime_settings(
+        default_request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        default_account_delay_seconds=DEFAULT_ACCOUNT_DELAY_SECONDS,
+        default_random_delay_max_seconds=DEFAULT_RANDOM_DELAY_MAX_SECONDS,
     )
-    account_delay_seconds = read_positive_float_environment(
-        "TASK_ACCOUNT_DELAY",
-        DEFAULT_ACCOUNT_DELAY_SECONDS,
-    )
+    timeout_seconds = runtime_settings.request_timeout_seconds
     privacy_mode = read_boolean_environment("HIFI_PRIVACY_MODE", True)
     notification_enabled = read_boolean_environment("HIFI_NOTIFY", True)
     user_agent = os.getenv("HIFI_USER_AGENT", DEFAULT_USER_AGENT).strip()
     if not user_agent:
         user_agent = DEFAULT_USER_AGENT
 
-    random_signin_enabled = read_boolean_environment("TASK_RANDOM_SIGNIN", True)
-    if random_signin_enabled:
-        maximum_random_delay = read_positive_float_environment(
-            "TASK_RANDOM_DELAY_MAX",
-            DEFAULT_RANDOM_DELAY_MAX_SECONDS,
-        )
-        if maximum_random_delay > 0:
-            delay_seconds = random.uniform(0, maximum_random_delay)
-            print(f"🎲 随机延迟：{format_time_remaining(delay_seconds)}")
-            wait_with_countdown(delay_seconds, "HiFi 签到")
+    apply_startup_random_delay(
+        "HiFi 签到",
+        runtime_settings,
+        has_work=bool(configurations),
+    )
 
     results: list[CheckinResult] = []
     for account_number, configuration in enumerate(configurations, start=1):
@@ -879,10 +874,11 @@ def main() -> int:
         results.append(result)
         print_result(result)
 
-        has_next_account = account_number < len(configurations)
-        if has_next_account and account_delay_seconds > 0:
-            print(f"等待 {account_delay_seconds:g} 秒后处理下一个账号")
-            time.sleep(account_delay_seconds)
+        wait_between_accounts(
+            account_number,
+            len(configurations),
+            runtime_settings.account_delay_seconds,
+        )
 
     (
         notification_title,

@@ -15,6 +15,9 @@ new Env('MT论坛签到')
   TG_NOTIFY_CONFIG 可选。统一 Telegram 配置：BotToken|ChatID|APIHost；
                    配置后使用 HTML 直发，失败回退青龙纯文本通知。
 
+账号密码登录成功后，会把会话保存到 /ql/data/scripts_data/mt_cookies.json，
+后续运行优先复用，失效后自动回退账号密码。
+
 通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
 
@@ -23,17 +26,24 @@ from __future__ import annotations
 import builtins
 import html
 import os
-import random
 import re
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
+from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
+
+from comm.cookie_store import CookieStore
+from comm.task_runtime import (
+    apply_startup_random_delay,
+    load_task_runtime_settings,
+    read_boolean_environment,
+    wait_between_accounts,
+)
 
 
 BASE_URL = "https://bbs.binmt.cc/"
@@ -52,6 +62,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0.0.0 Safari/537.36"
 )
+COOKIE_STORE = CookieStore("mt_cookies")
 
 
 class LoginFormParser(HTMLParser):
@@ -148,7 +159,7 @@ class MtForumCheckinClient:
     def checkin(self, account_number: int) -> CheckinResult:
         account_label = mask_identifier(self.credential.username)
         try:
-            sign_page_text = self._login_and_get_sign_page()
+            sign_page_text = self._authenticate_and_get_sign_page()
             form_hash = extract_form_hash(sign_page_text)
             sign_response_text = self._submit_checkin(form_hash)
             success, status, message = classify_checkin_response(sign_response_text)
@@ -186,6 +197,36 @@ class MtForumCheckinClient:
             )
         finally:
             self.session.close()
+
+    def _authenticate_and_get_sign_page(self) -> str:
+        account_key = self.credential.username
+        stored_cookie = COOKIE_STORE.read(account_key)
+        if stored_cookie:
+            try:
+                load_cookie_header(self.session, stored_cookie)
+            except ValueError as error:
+                print(f"[登录] {error}，回退账号密码")
+                COOKIE_STORE.remove(account_key)
+            else:
+                sign_page_text = self._get_sign_page()
+                if not is_login_required_page(sign_page_text):
+                    extract_form_hash(sign_page_text)
+                    refreshed_cookie = export_session_cookie_header(self.session)
+                    if refreshed_cookie:
+                        COOKIE_STORE.write(account_key, refreshed_cookie)
+                    print("[登录] 本地 Cookie 有效")
+                    return sign_page_text
+                print("[登录] 本地 Cookie 已失效，回退账号密码")
+                COOKIE_STORE.remove(account_key)
+            self.session.cookies.clear()
+
+        sign_page_text = self._login_and_get_sign_page()
+        extract_form_hash(sign_page_text)
+        current_cookie = export_session_cookie_header(self.session)
+        if current_cookie:
+            COOKIE_STORE.write(account_key, current_cookie)
+            print("[Cookie存储] 已保存最新 Cookie")
+        return sign_page_text
 
     def _login_and_get_sign_page(self) -> str:
         login_form_response = self.session.get(
@@ -400,6 +441,29 @@ def is_login_required_page(page_text: str) -> bool:
     return contains_any(page_text, ("您需要先登录", "请先登录后继续"))
 
 
+def load_cookie_header(session: requests.Session, cookie_header: str) -> None:
+    parsed_cookie = SimpleCookie()
+    try:
+        parsed_cookie.load(cookie_header)
+    except Exception as error:
+        raise ValueError("本地 Cookie 格式无效") from error
+    if not parsed_cookie:
+        raise ValueError("本地 Cookie 未包含有效字段")
+    session.cookies.clear()
+    for cookie_name, cookie_value in parsed_cookie.items():
+        session.cookies.set(cookie_name, cookie_value.value)
+
+
+def export_session_cookie_header(session: requests.Session) -> str:
+    cookie_values: dict[str, str] = {}
+    for cookie in session.cookies:
+        cookie_values[cookie.name] = cookie.value
+    return "; ".join(
+        f"{cookie_name}={cookie_value}"
+        for cookie_name, cookie_value in cookie_values.items()
+    )
+
+
 def describe_request_error(error: requests.RequestException) -> str:
     if error.response is not None:
         return f"HTTP {error.response.status_code}"
@@ -440,54 +504,6 @@ def mask_identifier(identifier: str) -> str:
     if len(identifier) == 2:
         return f"{identifier[0]}*"
     return f"{identifier[0]}***{identifier[-1]}"
-
-
-def read_positive_float_environment(
-    variable_name: str,
-    default_value: float,
-) -> float:
-    raw_value = os.getenv(variable_name, str(default_value)).strip()
-    try:
-        parsed_value = float(raw_value)
-    except ValueError:
-        print(f"[配置] {variable_name}={raw_value!r} 无效，使用默认值 {default_value}")
-        return default_value
-
-    if parsed_value < 0:
-        print(f"[配置] {variable_name} 不能为负数，使用默认值 {default_value}")
-        return default_value
-    return parsed_value
-
-
-def read_boolean_environment(variable_name: str, default_value: bool) -> bool:
-    raw_value = os.getenv(variable_name)
-    if raw_value is None:
-        return default_value
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def format_time_remaining(seconds: float) -> str:
-    """将秒数格式化为人类可读的时长描述。"""
-    total_seconds = int(seconds)
-    if total_seconds <= 0:
-        return "立即执行"
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours}小时{minutes}分{secs}秒"
-    if minutes > 0:
-        return f"{minutes}分{secs}秒"
-    return f"{secs}秒"
-
-
-def wait_with_countdown(delay_seconds: float, task_name: str) -> None:
-    """随机延迟等待，期间定期打印剩余时间倒计时。"""
-    remaining = delay_seconds
-    while remaining > 0:
-        print(f"{task_name} 倒计时：{format_time_remaining(remaining)}")
-        sleep_seconds = 1 if remaining <= 10 else min(10, remaining)
-        time.sleep(sleep_seconds)
-        remaining -= sleep_seconds
 
 
 def send_system_notification(title: str, content: str) -> bool:
@@ -695,26 +711,17 @@ def main() -> int:
     for configuration_error in configuration_errors:
         print(f"[配置错误] {configuration_error}")
 
-    request_timeout_seconds = read_positive_float_environment(
-        "TASK_TIMEOUT",
-        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    runtime_settings = load_task_runtime_settings(
+        default_request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        default_account_delay_seconds=DEFAULT_ACCOUNT_DELAY_SECONDS,
     )
-    account_delay_seconds = read_positive_float_environment(
-        "TASK_ACCOUNT_DELAY",
-        DEFAULT_ACCOUNT_DELAY_SECONDS,
-    )
+    request_timeout_seconds = runtime_settings.request_timeout_seconds
 
-    # 启动前随机延迟，避免固定时间签到触发风控
-    random_signin_enabled = read_boolean_environment("TASK_RANDOM_SIGNIN", True)
-    if random_signin_enabled:
-        max_random_delay = read_positive_float_environment(
-            "TASK_RANDOM_DELAY_MAX",
-            3600.0,
-        )
-        if max_random_delay > 0:
-            delay_seconds = random.uniform(0, max_random_delay)
-            print(f"🎲 随机延迟：{format_time_remaining(delay_seconds)}")
-            wait_with_countdown(delay_seconds, "MT论坛签到")
+    apply_startup_random_delay(
+        "MT论坛签到",
+        runtime_settings,
+        has_work=bool(credentials),
+    )
 
     results: list[CheckinResult] = []
     for account_index, credential in enumerate(credentials, start=1):
@@ -725,10 +732,11 @@ def main() -> int:
         results.append(result)
         print_result(result)
 
-        has_next_account = account_index < len(credentials)
-        if has_next_account and account_delay_seconds > 0:
-            print(f"等待 {account_delay_seconds:g} 秒后处理下一个账号")
-            time.sleep(account_delay_seconds)
+        wait_between_accounts(
+            account_index,
+            len(credentials),
+            runtime_settings.account_delay_seconds,
+        )
 
     notification_title, html_content, plain_content = build_notification_content(
         results,

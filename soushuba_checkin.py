@@ -14,6 +14,9 @@ new Env('搜书吧每日登录')
   TG_NOTIFY_CONFIG     可选。统一 Telegram 配置：BotToken|ChatID|APIHost；
                        配置后使用 HTML 直发，失败回退青龙纯文本通知。
 
+账号密码登录成功后，会把会话保存到
+/ql/data/scripts_data/soushuba_login_cookies.json，后续运行优先复用。
+
 通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
 
@@ -22,18 +25,24 @@ from __future__ import annotations
 import builtins
 import html
 import os
-import random
 import re
 import sys
-import time
 import urllib3
 from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
+from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import requests
+
+from comm.cookie_store import CookieStore
+from comm.task_runtime import (
+    apply_startup_random_delay,
+    load_task_runtime_settings,
+    wait_between_accounts,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -60,6 +69,7 @@ LOGINHASH_PATTERN = re.compile(
     r'<div\s+id="main_messa\w*e_([^"]+)"',
     re.IGNORECASE,
 )
+COOKIE_STORE = CookieStore("soushuba_login_cookies")
 
 
 @dataclass(frozen=True)
@@ -286,6 +296,34 @@ class SouShuBaClient:
     def login(self, account_number: int) -> LoginResult:
         account_label = mask_identifier(self.credential.username)
         try:
+            stored_cookie = COOKIE_STORE.read(self.credential.username)
+            if stored_cookie:
+                try:
+                    load_cookie_header(self.session, stored_cookie)
+                except ValueError as error:
+                    print(f"[登录] {error}，回退账号密码")
+                    COOKIE_STORE.remove(self.credential.username)
+                else:
+                    if self._is_session_established():
+                        refreshed_cookie = export_session_cookie_header(self.session)
+                        if refreshed_cookie:
+                            COOKIE_STORE.write(
+                                self.credential.username,
+                                refreshed_cookie,
+                            )
+                        details = self._extract_user_details()
+                        return LoginResult(
+                            account_number=account_number,
+                            account_label=details.get("username") or account_label,
+                            success=True,
+                            status="登录成功",
+                            message="本地 Cookie 登录状态有效",
+                            details=details,
+                        )
+                    print("[登录] 本地 Cookie 已失效，回退账号密码")
+                    COOKIE_STORE.remove(self.credential.username)
+                self.session.cookies.clear()
+
             login_hash, form_hash = self._fetch_login_tokens()
             login_response_text = self._submit_login(login_hash, form_hash)
 
@@ -299,6 +337,10 @@ class SouShuBaClient:
             if not self._is_session_established():
                 raise ValueError("登录后未建立会话，请检查账号密码")
 
+            current_cookie = export_session_cookie_header(self.session)
+            if current_cookie:
+                COOKIE_STORE.write(self.credential.username, current_cookie)
+                print("[Cookie存储] 已保存最新 Cookie")
             details = self._extract_user_details()
 
             return LoginResult(
@@ -456,6 +498,29 @@ def contains_any(value: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in value for keyword in keywords)
 
 
+def load_cookie_header(session: requests.Session, cookie_header: str) -> None:
+    parsed_cookie = SimpleCookie()
+    try:
+        parsed_cookie.load(cookie_header)
+    except Exception as error:
+        raise ValueError("本地 Cookie 格式无效") from error
+    if not parsed_cookie:
+        raise ValueError("本地 Cookie 未包含有效字段")
+    session.cookies.clear()
+    for cookie_name, cookie_value in parsed_cookie.items():
+        session.cookies.set(cookie_name, cookie_value.value)
+
+
+def export_session_cookie_header(session: requests.Session) -> str:
+    cookie_values: dict[str, str] = {}
+    for cookie in session.cookies:
+        cookie_values[cookie.name] = cookie.value
+    return "; ".join(
+        f"{cookie_name}={cookie_value}"
+        for cookie_name, cookie_value in cookie_values.items()
+    )
+
+
 def describe_request_error(error: requests.RequestException) -> str:
     if error.response is not None:
         return f"HTTP {error.response.status_code}"
@@ -494,52 +559,6 @@ def mask_identifier(identifier: str) -> str:
     if len(identifier) == 2:
         return f"{identifier[0]}*"
     return f"{identifier[0]}***{identifier[-1]}"
-
-
-def read_positive_float_environment(
-    variable_name: str,
-    default_value: float,
-) -> float:
-    raw_value = os.getenv(variable_name, str(default_value)).strip()
-    try:
-        parsed_value = float(raw_value)
-    except ValueError:
-        print(f"[配置] {variable_name}={raw_value!r} 无效，使用默认值 {default_value}")
-        return default_value
-
-    if parsed_value < 0:
-        print(f"[配置] {variable_name} 不能为负数，使用默认值 {default_value}")
-        return default_value
-    return parsed_value
-
-
-def read_boolean_environment(variable_name: str, default_value: bool) -> bool:
-    raw_value = os.getenv(variable_name)
-    if raw_value is None:
-        return default_value
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def format_time_remaining(seconds: float) -> str:
-    total_seconds = int(seconds)
-    if total_seconds <= 0:
-        return "立即执行"
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours}小时{minutes}分{secs}秒"
-    if minutes > 0:
-        return f"{minutes}分{secs}秒"
-    return f"{secs}秒"
-
-
-def wait_with_countdown(delay_seconds: float, task_name: str) -> None:
-    remaining = delay_seconds
-    while remaining > 0:
-        print(f"{task_name} 倒计时：{format_time_remaining(remaining)}")
-        sleep_seconds = 1 if remaining <= 10 else min(10, remaining)
-        time.sleep(sleep_seconds)
-        remaining -= sleep_seconds
 
 
 def send_system_notification(title: str, content: str) -> bool:
@@ -753,25 +772,17 @@ def main() -> int:
     for error in configuration_errors:
         print(f"[配置错误] {error}")
 
-    timeout_seconds = read_positive_float_environment(
-        "TASK_TIMEOUT",
-        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    runtime_settings = load_task_runtime_settings(
+        default_request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        default_account_delay_seconds=DEFAULT_ACCOUNT_DELAY_SECONDS,
     )
-    account_delay_seconds = read_positive_float_environment(
-        "TASK_ACCOUNT_DELAY",
-        DEFAULT_ACCOUNT_DELAY_SECONDS,
-    )
+    timeout_seconds = runtime_settings.request_timeout_seconds
 
-    random_signin_enabled = read_boolean_environment("TASK_RANDOM_SIGNIN", True)
-    if random_signin_enabled:
-        max_random_delay = read_positive_float_environment(
-            "TASK_RANDOM_DELAY_MAX",
-            3600.0,
-        )
-        if max_random_delay > 0:
-            delay_seconds = random.uniform(0, max_random_delay)
-            print(f"🎲 随机延迟：{format_time_remaining(delay_seconds)}")
-            wait_with_countdown(delay_seconds, "搜书吧登录")
+    apply_startup_random_delay(
+        "搜书吧登录",
+        runtime_settings,
+        has_work=bool(credentials),
+    )
 
     # 发现真实论坛域名（所有账号共用）
     entry_hostname = os.getenv("SOUSHUBA_HOSTNAME", DEFAULT_ENTRY_HOSTNAME)
@@ -795,10 +806,11 @@ def main() -> int:
             results.append(result)
             print_result(result)
 
-            has_next_account = account_index < len(credentials)
-            if has_next_account and account_delay_seconds > 0:
-                print(f"等待 {account_delay_seconds:g} 秒后处理下一个账号")
-                time.sleep(account_delay_seconds)
+            wait_between_accounts(
+                account_index,
+                len(credentials),
+                runtime_settings.account_delay_seconds,
+            )
 
     notification_title, html_content, plain_content = build_notification_content(
         results,
