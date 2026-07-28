@@ -350,10 +350,10 @@ def build_notification_content(
     }
 
     html_sections = [
-        "💬 <b>V2EX 每日签到</b>",
+        "<b>V2EX 每日签到</b>",
         "\n".join(
             [
-                "📊 <b>执行概览</b>",
+                "<b>执行概览</b>",
                 f"• 成功：{html_code(successful_count)}",
                 f"• 失败：{html_code(failed_count)}",
                 f"• 时间：{html_code(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}",
@@ -361,10 +361,10 @@ def build_notification_content(
         ),
     ]
     plain_sections = [
-        "💬 V2EX 每日签到",
+        "V2EX 每日签到",
         "\n".join(
             [
-                "📊 执行概览",
+                "执行概览",
                 f"• 成功：{successful_count}",
                 f"• 失败：{failed_count}",
                 f"• 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -397,13 +397,13 @@ def build_notification_content(
         plain_sections.append("\n".join(plain_account_lines))
 
     if configuration_errors:
-        html_error_lines = ["⚙️ <b>配置提示</b>"]
+        html_error_lines = ["<b>配置提示</b>"]
         html_error_lines.extend(
             f"• {escape_html_text(error)}" for error in configuration_errors
         )
         html_sections.append("\n".join(html_error_lines))
 
-        plain_error_lines = ["⚙️ 配置提示"]
+        plain_error_lines = ["配置提示"]
         plain_error_lines.extend(f"• {error}" for error in configuration_errors)
         plain_sections.append("\n".join(plain_error_lines))
 

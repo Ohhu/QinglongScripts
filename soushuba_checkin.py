@@ -11,13 +11,16 @@ new Env('搜书吧每日登录')
   TASK_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600（所有任务共用）。
   TASK_TIMEOUT         单次请求超时秒数，默认为 20（所有任务共用）。
   TASK_ACCOUNT_DELAY   多账号之间的等待秒数，默认为 3（所有任务共用）。
+  TG_NOTIFY_CONFIG     可选。统一 Telegram 配置：BotToken|ChatID|APIHost；
+                       配置后使用 HTML 直发，失败回退青龙纯文本通知。
 
-通知复用青龙注入的 QLAPI.systemNotify，直接走面板通知设置。
+通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
 
 from __future__ import annotations
 
 import builtins
+import html
 import os
 import random
 import re
@@ -73,22 +76,6 @@ class LoginResult:
     status: str
     message: str
     details: dict[str, str] = field(default_factory=dict)
-
-    def format_for_notification(self) -> str:
-        lines = [
-            f"账号 {self.account_number}（{self.account_label}）",
-            f"结果：{self.status}",
-            f"说明：{self.message}",
-        ]
-        label_map = {
-            "username": "用户名",
-            "credit": "银币",
-        }
-        for key, label in label_map.items():
-            value = self.details.get(key)
-            if value:
-                lines.append(f"{label}：{value}")
-        return "\n".join(lines)
 
 
 class DiscoveryPageParser(HTMLParser):
@@ -575,26 +562,172 @@ def send_system_notification(title: str, content: str) -> bool:
     return True
 
 
+def escape_html_text(value: Any) -> str:
+    return html.escape(str(value).replace("\n", " "), quote=False)
+
+
+def html_code(value: Any) -> str:
+    return f"<code>{escape_html_text(value)}</code>"
+
+
 def build_notification_content(
     results: list[LoginResult],
     configuration_errors: list[str],
     hostname_error: str | None,
-) -> str:
+) -> tuple[str, str, str]:
     successful_count = sum(result.success for result in results)
     failed_count = len(results) - successful_count
-    sections = [
-        f"执行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"账号统计：成功 {successful_count}，失败 {failed_count}",
+    status_icon = "✅" if failed_count == 0 and successful_count > 0 else "⚠️"
+    title = f"搜书吧每日登录 {status_icon} {successful_count}/{len(results)}"
+    execution_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detail_labels = {
+        "username": "用户名",
+        "credit": "银币",
+    }
+
+    html_sections = [
+        "<b>搜书吧每日登录</b>",
+        "\n".join(
+            [
+                "<b>执行概览</b>",
+                f"• 成功：{html_code(successful_count)}",
+                f"• 失败：{html_code(failed_count)}",
+                f"• 时间：{html_code(execution_time)}",
+            ]
+        ),
+    ]
+    plain_sections = [
+        "搜书吧每日登录",
+        "\n".join(
+            [
+                "执行概览",
+                f"• 成功：{successful_count}",
+                f"• 失败：{failed_count}",
+                f"• 时间：{execution_time}",
+            ]
+        ),
     ]
 
+    for result in results:
+        result_icon = "✅" if result.success else "❌"
+        html_account_lines = [
+            f"{result_icon} <b>账号 {result.account_number} · "
+            f"{escape_html_text(result.account_label)}</b>",
+            f"• 状态：<b>{escape_html_text(result.status)}</b>",
+            f"• 说明：{escape_html_text(result.message)}",
+        ]
+        plain_account_lines = [
+            f"{result_icon} 账号 {result.account_number} · {result.account_label}",
+            f"• 状态：{result.status}",
+            f"• 说明：{result.message}",
+        ]
+        for detail_key, detail_value in result.details.items():
+            detail_label = detail_labels.get(detail_key, detail_key)
+            html_account_lines.append(
+                f"• {escape_html_text(detail_label)}：{html_code(detail_value)}",
+            )
+            plain_account_lines.append(f"• {detail_label}：{detail_value}")
+        html_sections.append("\n".join(html_account_lines))
+        plain_sections.append("\n".join(plain_account_lines))
+
     if hostname_error:
-        sections.append(f"域名发现失败：{hostname_error}")
+        html_sections.append(
+            "\n".join(
+                [
+                    "<b>域名发现提示</b>",
+                    f"• {escape_html_text(hostname_error)}",
+                ]
+            )
+        )
+        plain_sections.append(f"域名发现提示\n• {hostname_error}")
 
     if configuration_errors:
-        sections.append("配置错误：\n" + "\n".join(configuration_errors))
+        html_error_lines = ["<b>配置提示</b>"]
+        html_error_lines.extend(
+            f"• {escape_html_text(error)}" for error in configuration_errors
+        )
+        html_sections.append("\n".join(html_error_lines))
 
-    sections.extend(result.format_for_notification() for result in results)
-    return "\n\n".join(sections)
+        plain_error_lines = ["配置提示"]
+        plain_error_lines.extend(f"• {error}" for error in configuration_errors)
+        plain_sections.append("\n".join(plain_error_lines))
+
+    return title, "\n\n".join(html_sections), "\n\n".join(plain_sections)
+
+
+def read_telegram_notify_configuration() -> tuple[str, str, str] | None:
+    raw_configuration = os.getenv("TG_NOTIFY_CONFIG", "").strip()
+    if not raw_configuration:
+        return None
+
+    configuration_parts = raw_configuration.split("|", maxsplit=2)
+    if len(configuration_parts) != 3:
+        print("[通知] TG_NOTIFY_CONFIG 格式错误，应为 BotToken|ChatID|APIHost")
+        return None
+
+    bot_token, chat_id, api_host = (part.strip() for part in configuration_parts)
+    if not bot_token or not chat_id:
+        print("[通知] TG_NOTIFY_CONFIG 缺少 BotToken 或 ChatID")
+        return None
+
+    api_host = (api_host or "https://api.telegram.org").rstrip("/")
+    return bot_token, chat_id, api_host
+
+
+def send_telegram_html_notification(content: str, timeout_seconds: float) -> bool:
+    notify_configuration = read_telegram_notify_configuration()
+    if notify_configuration is None:
+        return False
+
+    bot_token, chat_id, api_host = notify_configuration
+    try:
+        response = requests.post(
+            f"{api_host}/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": content,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=timeout_seconds,
+        )
+    except requests.RequestException as error:
+        print(f"[通知] Telegram HTML 直发网络错误：{describe_request_error(error)}")
+        return False
+
+    try:
+        response_data = response.json()
+    except ValueError:
+        print(f"[通知] Telegram HTML 直发返回异常：HTTP {response.status_code}")
+        return False
+
+    if response.status_code != 200 or not response_data.get("ok"):
+        error_description = str(response_data.get("description", "未知错误"))
+        print(f"[通知] Telegram HTML 直发失败：{error_description}")
+        return False
+
+    message_result = response_data.get("result", {})
+    if isinstance(message_result, dict):
+        print(
+            "[通知] Telegram HTML 直发成功，"
+            f"message_id={message_result.get('message_id')}",
+        )
+    else:
+        print("[通知] Telegram HTML 直发成功")
+    return True
+
+
+def send_notifications(
+    title: str,
+    html_content: str,
+    plain_content: str,
+    timeout_seconds: float,
+) -> None:
+    if send_telegram_html_notification(html_content, timeout_seconds):
+        return
+
+    print("[通知] 使用青龙纯文本通知回退")
+    send_system_notification(title, plain_content)
 
 
 def print_result(result: LoginResult) -> None:
@@ -667,15 +800,20 @@ def main() -> int:
                 print(f"等待 {account_delay_seconds:g} 秒后处理下一个账号")
                 time.sleep(account_delay_seconds)
 
-    notification_content = build_notification_content(
+    notification_title, html_content, plain_content = build_notification_content(
         results,
         configuration_errors,
         hostname_error,
     )
     print("\n==== 搜书吧每日登录汇总 ====")
-    print(notification_content)
+    print(plain_content)
 
-    send_system_notification("搜书吧每日登录", notification_content)
+    send_notifications(
+        notification_title,
+        html_content,
+        plain_content,
+        timeout_seconds,
+    )
 
     all_succeeded = bool(results) and all(r.success for r in results)
     config_valid = not configuration_errors and hostname_error is None

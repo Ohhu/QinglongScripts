@@ -3,6 +3,11 @@
 """
 cron: 0 9 * * *
 new Env('百度网盘签到')
+
+环境变量：
+  BAIDU_COOKIE         必填。完整 Cookie，多账号使用换行分隔。
+  TG_NOTIFY_CONFIG     可选。统一 Telegram 配置：BotToken|ChatID|APIHost；
+                       配置后使用 HTML 直发，失败回退青龙纯文本通知。
 """
 
 import os
@@ -11,6 +16,7 @@ import re
 import requests
 import random
 import builtins
+import html
 from datetime import datetime, timedelta
 
 # 配置项
@@ -63,20 +69,203 @@ def wait_with_countdown(delay_seconds, task_name):
         time.sleep(sleep_time)
         remaining -= sleep_time
 
-def notify_user(title, content):
-    """统一通知函数：使用青龙系统通知"""
+def escape_html_text(value):
+    return html.escape(str(value).replace("\n", " "), quote=False)
+
+
+def html_code(value):
+    return f"<code>{escape_html_text(value)}</code>"
+
+
+def read_telegram_notify_configuration():
+    raw_configuration = os.getenv("TG_NOTIFY_CONFIG", "").strip()
+    if not raw_configuration:
+        return None
+
+    configuration_parts = raw_configuration.split("|", maxsplit=2)
+    if len(configuration_parts) != 3:
+        print("[通知] TG_NOTIFY_CONFIG 格式错误，应为 BotToken|ChatID|APIHost")
+        return None
+
+    bot_token, chat_id, api_host = (part.strip() for part in configuration_parts)
+    if not bot_token or not chat_id:
+        print("[通知] TG_NOTIFY_CONFIG 缺少 BotToken 或 ChatID")
+        return None
+
+    api_host = (api_host or "https://api.telegram.org").rstrip("/")
+    return bot_token, chat_id, api_host
+
+
+def send_telegram_html_notification(content):
+    notify_configuration = read_telegram_notify_configuration()
+    if notify_configuration is None:
+        return False
+
+    bot_token, chat_id, api_host = notify_configuration
+    try:
+        response = requests.post(
+            f"{api_host}/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": content,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=task_timeout,
+        )
+    except requests.exceptions.RequestException as error:
+        print(f"[通知] Telegram HTML 直发网络错误：{type(error).__name__}")
+        return False
+
+    try:
+        response_data = response.json()
+    except ValueError:
+        print(f"[通知] Telegram HTML 直发返回异常：HTTP {response.status_code}")
+        return False
+
+    if response.status_code != 200 or not response_data.get("ok"):
+        error_description = str(response_data.get("description", "未知错误"))
+        print(f"[通知] Telegram HTML 直发失败：{error_description}")
+        return False
+
+    message_result = response_data.get("result", {})
+    if isinstance(message_result, dict):
+        print(
+            "[通知] Telegram HTML 直发成功，"
+            f"message_id={message_result.get('message_id')}",
+        )
+    else:
+        print("[通知] Telegram HTML 直发成功")
+    return True
+
+
+def send_system_notification(title, content):
     qinglong_api = getattr(builtins, "QLAPI", None)
     if qinglong_api is None:
         print(f"[通知] 非青龙环境，跳过：{title}")
-        return
+        return False
     try:
         response = qinglong_api.systemNotify({"title": title, "content": content})
         if isinstance(response, dict) and response.get("code") == 200:
-            print(f"✅ 通知发送完成：{title}")
+            print(f"[通知] 面板系统通知发送完成：{title}")
+            return True
         else:
-            print(f"❌ 系统通知返回异常：{response}")
+            print(f"[通知] 面板系统通知返回异常：{response}")
     except Exception as error:
-        print(f"❌ 系统通知调用失败：{type(error).__name__}: {error}")
+        print(f"[通知] 面板系统通知调用失败：{type(error).__name__}: {error}")
+    return False
+
+
+def notify_user(title, html_content, plain_content):
+    """优先发送 Telegram HTML，失败时回退青龙纯文本通知。"""
+    if send_telegram_html_notification(html_content):
+        return True
+
+    print("[通知] 使用青龙纯文本通知回退")
+    return send_system_notification(title, plain_content)
+
+
+def build_account_notification(
+    account_number,
+    user,
+    level,
+    growth_value,
+    vip_status,
+    signin_message,
+    answer_message,
+    is_success,
+):
+    result_icon = "✅" if is_success else "❌"
+    result_text = "成功" if is_success else "失败"
+    title = f"百度网盘账号 {account_number} 签到{result_text}"
+    execution_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    html_lines = [
+        "<b>百度网盘每日签到</b>",
+        "",
+        f"{result_icon} <b>账号 {account_number} · {escape_html_text(user)}</b>",
+        f"• 签到：{escape_html_text(signin_message)}",
+    ]
+    plain_lines = [
+        "百度网盘每日签到",
+        "",
+        f"{result_icon} 账号 {account_number} · {user}",
+        f"• 签到：{signin_message}",
+    ]
+
+    if answer_message:
+        html_lines.append(f"• 答题：{escape_html_text(answer_message)}")
+        plain_lines.append(f"• 答题：{answer_message}")
+
+    html_lines.extend(
+        [
+            f"• 等级：{html_code(f'Lv.{level}')}（成长值 {html_code(growth_value)}）",
+            f"• 会员：{escape_html_text(vip_status)}",
+            f"• 时间：{html_code(execution_time)}",
+        ]
+    )
+    plain_lines.extend(
+        [
+            f"• 等级：Lv.{level}（成长值 {growth_value}）",
+            f"• 会员：{vip_status}",
+            f"• 时间：{execution_time}",
+        ]
+    )
+    return title, "\n".join(html_lines), "\n".join(plain_lines)
+
+
+def build_configuration_error_notification(error_message):
+    title = "百度网盘签到配置错误"
+    html_content = "\n\n".join(
+        [
+            "<b>百度网盘每日签到</b>",
+            f"<b>配置提示</b>\n• {escape_html_text(error_message)}",
+        ]
+    )
+    plain_content = "\n\n".join(
+        [
+            "百度网盘每日签到",
+            f"配置提示\n• {error_message}",
+        ]
+    )
+    return title, html_content, plain_content
+
+
+def build_summary_notification(results):
+    total_count = len(results)
+    successful_count = sum(result["success"] for result in results)
+    failed_count = total_count - successful_count
+    execution_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    title = f"百度网盘签到汇总 {successful_count}/{total_count}"
+
+    html_lines = [
+        "<b>百度网盘签到汇总</b>",
+        "",
+        "<b>执行概览</b>",
+        f"• 成功：{html_code(successful_count)}",
+        f"• 失败：{html_code(failed_count)}",
+        f"• 时间：{html_code(execution_time)}",
+    ]
+    plain_lines = [
+        "百度网盘签到汇总",
+        "",
+        "执行概览",
+        f"• 成功：{successful_count}",
+        f"• 失败：{failed_count}",
+        f"• 时间：{execution_time}",
+    ]
+
+    for result in results:
+        result_icon = "✅" if result["success"] else "❌"
+        html_lines.append(
+            f"{result_icon} 账号 {html_code(result['index'])} · "
+            f"{escape_html_text(result['user'])}",
+        )
+        plain_lines.append(
+            f"{result_icon} 账号 {result['index']} · {result['user']}",
+        )
+
+    return title, "\n".join(html_lines), "\n".join(plain_lines)
 
 class BaiduPan:
     name = "百度网盘"
@@ -298,7 +487,16 @@ class BaiduPan:
 """
             
             print(f"❌ {error_msg}")
-            return error_msg, False
+            notification_title, html_content, plain_content = (
+                build_configuration_error_notification("未配置 BAIDU_COOKIE 环境变量")
+            )
+            return (
+                notification_title,
+                html_content,
+                plain_content,
+                False,
+                "未知用户",
+            )
 
         # 1. 执行签到
         signin_success, signin_msg = self.signin()
@@ -316,24 +514,26 @@ class BaiduPan:
         # 4. 获取用户信息
         user, level, value, vip_status = self.get_user_info()
         
-        # 5. 组合结果消息
-        final_msg = f"""🌟 百度网盘签到结果
-
-👤 账号: {user}
-🏆 等级: Lv.{level} ({value}成长值)
-💎 会员: {vip_status}
-
-📝 签到: {signin_msg}"""
-
-        if answer_msg:
-            final_msg += f"\n🤔 答题: {answer_msg}"
-
-        final_msg += f"\n⏰ 时间: {datetime.now().strftime('%m-%d %H:%M')}"
-        
         # 签到或答题任一成功都算成功
         is_success = signin_success or answer_success
+        notification_title, html_content, plain_content = build_account_notification(
+            self.index,
+            user,
+            level,
+            value,
+            vip_status,
+            signin_msg,
+            answer_msg,
+            is_success,
+        )
         print(f"{'✅ 任务完成' if is_success else '❌ 任务失败'}")
-        return final_msg, is_success
+        return (
+            notification_title,
+            html_content,
+            plain_content,
+            is_success,
+            user,
+        )
 
 def main():
     """主程序入口"""
@@ -353,20 +553,12 @@ def main():
     baidu_cookies = BAIDU_COOKIE
     
     if not baidu_cookies:
-        error_msg = """❌ 未找到BAIDU_COOKIE环境变量
-
-🔧 获取Cookie的方法:
-1. 打开百度网盘网页版: https://pan.baidu.com/
-2. 登录您的账号
-3. 按F12打开开发者工具
-4. 切换到Network标签页，刷新页面
-5. 找到任意请求的Request Headers
-6. 复制完整的Cookie值
-7. 在青龙面板中添加环境变量BAIDU_COOKIE
-"""
-        
+        error_msg = "未配置 BAIDU_COOKIE 环境变量"
         print(error_msg)
-        notify_user("百度网盘签到失败", error_msg)
+        notification_title, html_content, plain_content = (
+            build_configuration_error_notification(error_msg)
+        )
+        notify_user(notification_title, html_content, plain_content)
         return
 
     # 支持多账号（用换行分隔）
@@ -392,7 +584,13 @@ def main():
             
             # 执行签到
             baidu_pan = BaiduPan(cookie, index + 1)
-            result_msg, is_success = baidu_pan.main()
+            (
+                notification_title,
+                html_content,
+                plain_content,
+                is_success,
+                account_label,
+            ) = baidu_pan.main()
             
             if is_success:
                 success_count += 1
@@ -400,37 +598,28 @@ def main():
             results.append({
                 'index': index + 1,
                 'success': is_success,
-                'message': result_msg
+                'user': account_label,
             })
-            
-            # 发送单个账号通知
-            status = "成功" if is_success else "失败"
-            title = f"百度网盘账号{index + 1}签到{status}"
-            notify_user(title, result_msg)
+
+            notify_user(notification_title, html_content, plain_content)
             
         except Exception as e:
             error_msg = f"账号{index + 1}: 执行异常 - {str(e)}"
             print(f"❌ {error_msg}")
-            notify_user(f"百度网盘账号{index + 1}签到失败", error_msg)
+            notification_title, html_content, plain_content = (
+                build_configuration_error_notification(error_msg)
+            )
+            notify_user(notification_title, html_content, plain_content)
+            results.append({
+                'index': index + 1,
+                'success': False,
+                'user': "未知用户",
+            })
     
     # 发送汇总通知
     if total_count > 1:
-        summary_msg = f"""📊 百度网盘签到汇总
-
-📈 总计: {total_count}个账号
-✅ 成功: {success_count}个
-❌ 失败: {total_count - success_count}个
-📊 成功率: {success_count/total_count*100:.1f}%
-⏰ 完成时间: {datetime.now().strftime('%m-%d %H:%M')}"""
-        
-        # 添加详细结果（最多显示5个账号的详情）
-        if len(results) <= 5:
-            summary_msg += "\n\n📋 详细结果:"
-            for result in results:
-                status_icon = "✅" if result['success'] else "❌"
-                summary_msg += f"\n{status_icon} 账号{result['index']}"
-        
-        notify_user("百度网盘签到汇总", summary_msg)
+        summary_title, summary_html, summary_plain = build_summary_notification(results)
+        notify_user(summary_title, summary_html, summary_plain)
     
     print(f"\n==== 百度网盘签到完成 - 成功{success_count}/{total_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ====")
 
