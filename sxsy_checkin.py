@@ -23,13 +23,13 @@ new Env('尚香书苑签到')
   TASK_TIMEOUT         单次请求超时秒数，默认为 20（所有任务共用）。
   TASK_ACCOUNT_DELAY   多账号之间的等待秒数，默认为 3（所有任务共用）。
 
-站点发布页 https://sxsy.org/ 把最新域名放在 site.jpg 图片里，
-脚本下载该图片后用 EasyOCR 云端识别域名；识别失败回退上次成功的
-域名缓存，再失败使用内置默认域名。
+站点发布页 https://sxsy.org/ 把最新域名放在 site.jpg 图片里。
+脚本优先验证上次成功的域名缓存；缓存不可用时下载图片并使用
+EasyOCR 云端识别最新域名，再失败则使用内置默认域名。
 
-Cookie 持久化：账密登录成功后把最新 Cookie 存入本地文件
-（/ql/data/scripts_data/sxsy_cookies.json），之后运行优先用本地存储的
-Cookie，失效后自动清理并依次回退环境变量 Cookie、账密重新登录。
+Cookie 持久化：账密登录成功后把最新 Cookie 存入青龙数据目录
+（默认 /ql/data/scripts_data/sxsy_cookies.json），之后运行优先用本地
+存储的 Cookie，失效后自动清理并依次回退环境变量 Cookie、账密登录。
 
 通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
 """
@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
@@ -60,15 +60,16 @@ RELEASE_PAGE_URL = "https://sxsy.org/"
 DOMAIN_IMAGE_PATH = "site.jpg"
 DEFAULT_HOST = "sxsy13.com"
 
-# 本地数据统一放在 /ql/data/scripts_data/（青龙持久卷），
-# 非青龙环境降级到脚本旁 ./scripts_data/，目录不存在时自动创建。
-QINGLONG_DATA_DIR = "/ql/data/scripts_data"
-if not os.path.isdir(QINGLONG_DATA_DIR):
-    QINGLONG_DATA_DIR = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "scripts_data",
-    )
-os.makedirs(QINGLONG_DATA_DIR, exist_ok=True)
+# 本地数据固定放在青龙持久卷中；目录不存在时直接创建，不把运行数据
+# 混入可能被订阅删除或改名的脚本目录。
+QINGLONG_DATA_ROOT = os.getenv("QL_DATA_DIR", "").strip() or "/ql/data"
+QINGLONG_DATA_DIR = os.path.join(QINGLONG_DATA_ROOT, "scripts_data")
+try:
+    os.makedirs(QINGLONG_DATA_DIR, exist_ok=True)
+except OSError as error:
+    raise RuntimeError(
+        f"无法创建脚本数据目录 {QINGLONG_DATA_DIR}：{error}",
+    ) from error
 
 DOMAIN_CACHE_PATH = os.path.join(QINGLONG_DATA_DIR, "sxsy_last_host")
 COOKIE_STORE_PATH = os.path.join(QINGLONG_DATA_DIR, "sxsy_cookies.json")
@@ -80,6 +81,9 @@ LOGIN_HASH_PATTERN = re.compile(r"loginhash=([a-zA-Z0-9]{5})")
 SIGN_HASH_PATTERN = re.compile(r"formhash=([a-zA-Z0-9]{8})")
 WELCOME_PATTERN = re.compile(r"欢迎您回来，(.*?)，")
 MONEY_PATTERN = re.compile(r"金钱:\s*</em>(\d+)")
+MATH_VERIFICATION_PATTERN = re.compile(
+    r"签到验证\s*[：:]\s*(-?\d+)\s*([+\-*/×÷xX])\s*(-?\d+)\s*=\s*\?",
+)
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
@@ -118,6 +122,10 @@ class CheckinResult:
     status: str
     message: str
     details: dict[str, str] = field(default_factory=dict)
+
+
+class MathVerificationError(ValueError):
+    """签到算术验证题无法安全解析或计算。"""
 
 
 def parse_account_configurations(
@@ -293,6 +301,38 @@ def write_cached_host(host: str) -> None:
         print(f"[域名发现] 写入域名缓存失败：{error}")
 
 
+def validate_host(host: str, timeout_seconds: float) -> str | None:
+    """验证站点登录页可用，并返回重定向后的实际域名。"""
+    login_page_url = (
+        f"https://{host}/member.php?mod=logging&action=login"
+        "&infloat=yes&frommessage&inajax=1&ajaxtarget=messagelogin"
+    )
+    try:
+        response = requests.get(
+            login_page_url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        print(
+            f"[域名发现] 候选域名 {host} 访问失败："
+            f"{describe_request_error(error)}",
+        )
+        return None
+
+    login_page_is_valid = bool(
+        FORM_HASH_PATTERN.search(response.text)
+        and LOGIN_HASH_PATTERN.search(response.text)
+    )
+    if not login_page_is_valid:
+        print(f"[域名发现] 候选域名 {host} 未返回有效登录页面")
+        return None
+
+    redirected_host = urlparse(response.url).hostname
+    return redirected_host.lower() if redirected_host else host
+
+
 def resolve_host(
     ocr_key: str,
     timeout_seconds: float,
@@ -301,16 +341,34 @@ def resolve_host(
     if configured_host:
         return configured_host, None
 
-    discovered_host = discover_host_via_ocr(ocr_key, timeout_seconds)
-    if discovered_host:
-        write_cached_host(discovered_host)
-        print(f"[域名发现] OCR 识别到最新域名：{discovered_host}")
-        return discovered_host, None
-
     cached_host = read_cached_host()
     if cached_host:
-        print(f"[域名发现] OCR 识别失败，回退缓存域名：{cached_host}")
-        return cached_host, None
+        validated_host = validate_host(cached_host, timeout_seconds)
+        if validated_host:
+            if validated_host != cached_host:
+                write_cached_host(validated_host)
+                print(
+                    "[域名发现] 缓存域名已重定向，更新为："
+                    f"{validated_host}",
+                )
+            else:
+                print(f"[域名发现] 缓存域名可用：{cached_host}")
+            return validated_host, None
+        print("[域名发现] 缓存域名不可用，重新从发布页识别")
+
+    if not ocr_key:
+        error_message = "缓存域名不可用且未配置 OCR_KEY，无法自动发现最新域名"
+        print(f"[域名发现] {error_message}，使用默认域名：{DEFAULT_HOST}")
+        return DEFAULT_HOST, error_message
+
+    discovered_host = discover_host_via_ocr(ocr_key, timeout_seconds)
+    if discovered_host:
+        validated_host = validate_host(discovered_host, timeout_seconds)
+        if validated_host:
+            write_cached_host(validated_host)
+            print(f"[域名发现] OCR 识别到最新域名：{validated_host}")
+            return validated_host, None
+        print(f"[域名发现] OCR 识别域名不可用：{discovered_host}")
 
     print(f"[域名发现] OCR 识别失败且无缓存，使用默认域名：{DEFAULT_HOST}")
     return DEFAULT_HOST, None
@@ -368,6 +426,20 @@ class SxsyCheckinClient:
                 )
 
             sign_page_text = self._fetch_sign_page()
+            if is_confirmed_signed_page(sign_page_text):
+                details: dict[str, str] = {}
+                money = self._fetch_money()
+                if money:
+                    details["金钱"] = money
+                return CheckinResult(
+                    account_number=account_number,
+                    account_label=account_label,
+                    success=True,
+                    status="今日已签到",
+                    message="签到页面确认今日已签到",
+                    details=details,
+                )
+
             sign_hash_match = SIGN_HASH_PATTERN.search(sign_page_text)
             if not sign_hash_match:
                 return self._failure_result(
@@ -379,6 +451,12 @@ class SxsyCheckinClient:
             sign_response_text = self._submit_checkin(sign_hash_match.group(1))
             sign_message = extract_cdata_message(sign_response_text)
             success, status = classify_sign_message(sign_message)
+            if not success:
+                confirmation_page_text = self._fetch_sign_page()
+                if is_confirmed_signed_page(confirmation_page_text):
+                    success = True
+                    status = "签到成功"
+                    sign_message = sign_message or "签到成功，页面状态已确认"
 
             details: dict[str, str] = {}
             money = self._fetch_money()
@@ -410,6 +488,12 @@ class SxsyCheckinClient:
                 account_number,
                 account_label,
                 f"网络请求失败：{describe_request_error(error)}",
+            )
+        except MathVerificationError as error:
+            return self._failure_result(
+                account_number,
+                account_label,
+                f"签到计算验证失败：{error}",
             )
         except Exception as error:
             return self._failure_result(
@@ -588,10 +672,51 @@ class SxsyCheckinClient:
         return response.text
 
     def _submit_checkin(self, sign_hash: str) -> str:
+        sign_url = f"https://{self.host}/plugin.php"
+        sign_parameters = {
+            "id": "k_misign:sign",
+            "operation": "qiandao",
+            "format": "global_usernav_extra",
+            "formhash": sign_hash,
+            "inajax": "1",
+            "ajaxtarget": "k_misign_topb",
+        }
         response = self.session.get(
-            f"https://{self.host}/plugin.php?id=k_misign:sign"
-            "&operation=qiandao&format=global_usernav_extra"
-            f"&formhash={sign_hash}&inajax=1&ajaxtarget=k_misign_topb",
+            sign_url,
+            params=sign_parameters,
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+
+        verification_expression = parse_math_verification(response.text)
+        if verification_expression is None:
+            if "mathverify_answer" in response.text or "签到验证" in response.text:
+                raise MathVerificationError("签到计算验证题格式无法识别")
+            return response.text
+
+        left_operand, math_operator, right_operand = verification_expression
+        verification_answer = calculate_math_verification_answer(
+            left_operand,
+            math_operator,
+            right_operand,
+        )
+        print(
+            "[签到] 检测到计算验证："
+            f"{left_operand} {math_operator} {right_operand} = "
+            f"{verification_answer}",
+        )
+
+        # 站点首次签到只下发算术题，答案需通过同一签到接口再次提交。
+        verification_parameters = {
+            "id": "k_misign:sign",
+            "operation": "qiandao",
+            "formhash": sign_hash,
+            "format": "global_usernav_extra",
+            "mathverify_answer": verification_answer,
+        }
+        response = self.session.get(
+            sign_url,
+            params=verification_parameters,
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
@@ -645,6 +770,41 @@ def extract_cdata_message(response_text: str) -> str:
     return " ".join(html.unescape(message_source).split())
 
 
+def parse_math_verification(response_text: str) -> tuple[int, str, int] | None:
+    decoded_response_text = html.unescape(response_text)
+    verification_match = MATH_VERIFICATION_PATTERN.search(decoded_response_text)
+    if verification_match is None:
+        return None
+
+    return (
+        int(verification_match.group(1)),
+        verification_match.group(2),
+        int(verification_match.group(3)),
+    )
+
+
+def calculate_math_verification_answer(
+    left_operand: int,
+    math_operator: str,
+    right_operand: int,
+) -> str:
+    if math_operator == "+":
+        return str(left_operand + right_operand)
+    if math_operator == "-":
+        return str(left_operand - right_operand)
+    if math_operator in {"*", "×", "x", "X"}:
+        return str(left_operand * right_operand)
+    if math_operator in {"/", "÷"}:
+        if right_operand == 0:
+            raise MathVerificationError("签到计算验证题存在除零运算")
+        quotient, remainder = divmod(left_operand, right_operand)
+        if remainder != 0:
+            raise MathVerificationError("签到计算验证题的除法结果不是整数")
+        return str(quotient)
+
+    raise MathVerificationError(f"签到计算验证题包含不支持的运算符：{math_operator}")
+
+
 def classify_sign_message(sign_message: str) -> tuple[bool, str]:
     if not sign_message:
         return False, "失败"
@@ -653,6 +813,19 @@ def classify_sign_message(sign_message: str) -> tuple[bool, str]:
     if contains_any(sign_message, ("签到成功", "恭喜")):
         return True, "签到成功"
     return False, "失败"
+
+
+def is_confirmed_signed_page(sign_page_text: str) -> bool:
+    """通过签到页面结构确认今日是否已完成签到。
+
+    k_misign 的已签到页面仍包含 formhash，但会移除 qiandao 操作入口；
+    lxdays 是签到页自身的连续天数元素，用于避免把异常页面误判为成功。
+    """
+    has_sign_page_marker = bool(
+        re.search(r'id=["\']lxdays["\']', sign_page_text, re.IGNORECASE),
+    )
+    has_checkin_action = "operation=qiandao" in html.unescape(sign_page_text)
+    return has_sign_page_marker and not has_checkin_action
 
 
 def contains_any(text: str, keywords: tuple[str, ...]) -> bool:
@@ -919,12 +1092,12 @@ def main() -> int:
         configuration_errors.append("未配置 SXSY_ACCOUNTS 环境变量")
 
     ocr_key = os.getenv("OCR_KEY", "").strip()
-    needs_ocr = any(
+    password_login_needs_ocr = any(
         configuration.password for configuration in configurations
-    ) or not os.getenv("SXSY_HOST", "").strip()
-    if needs_ocr and not ocr_key:
+    )
+    if password_login_needs_ocr and not ocr_key:
         configuration_errors.append(
-            "账密登录或自动域名发现需要配置 OCR_KEY",
+            "账密登录需要配置 OCR_KEY",
         )
 
     for configuration_error in configuration_errors:
@@ -951,7 +1124,10 @@ def main() -> int:
             print(f"🎲 随机延迟：{format_time_remaining(delay_seconds)}")
             wait_with_countdown(delay_seconds, "尚香书苑签到")
 
-    host, _ = resolve_host(ocr_key, timeout_seconds)
+    host, host_resolution_error = resolve_host(ocr_key, timeout_seconds)
+    if host_resolution_error:
+        configuration_errors.append(host_resolution_error)
+        print(f"[配置错误] {host_resolution_error}")
 
     results: list[CheckinResult] = []
     for account_index, configuration in enumerate(configurations, start=1):
