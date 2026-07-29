@@ -26,7 +26,11 @@ new Env('直播源论坛每日登录')
 避免每次都重新提交账号密码。
 """
 
-from comm.discuz_login_common import DiscuzSiteConfiguration, execute_site_login
+from comm.discuz_login_common import (
+    DiscuzCreditConfiguration,
+    DiscuzSiteConfiguration,
+    execute_site_login,
+)
 
 
 SITE_CONFIGURATION = DiscuzSiteConfiguration(
@@ -39,6 +43,14 @@ SITE_CONFIGURATION = DiscuzSiteConfiguration(
     notify_environment_name="LIVECODES_NOTIFY",
     privacy_environment_name="LIVECODES_PRIVACY_MODE",
     connection_error_message="无法连接直播源论坛",
+    credit=DiscuzCreditConfiguration(
+        page_path=(
+            "home.php?mod=spacecp&ac=credit&showcredit=1"
+            "&inajax=1&ajaxtarget=extcreditmenu_menu"
+        ),
+        field_id="hcredit_2",
+        display_name="金钱",
+    ),
 )
 
 

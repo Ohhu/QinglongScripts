@@ -42,11 +42,14 @@ USER_AGENT = (
 )
 
 LOGIN_PAGE_PATH = "member.php?mod=logging&action=login"
-CREDIT_PAGE_PATH = (
-    "home.php?mod=spacecp&ac=credit&showcredit=1"
-    "&inajax=1&ajaxtarget=extcreditmenu_menu"
-)
 FALLBACK_HTTP_ENCODINGS = {"iso-8859-1", "latin-1"}
+
+
+@dataclass(frozen=True)
+class DiscuzCreditConfiguration:
+    page_path: str
+    field_id: str
+    display_name: str
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,7 @@ class DiscuzSiteConfiguration:
     notify_environment_name: str
     privacy_environment_name: str
     connection_error_message: str
+    credit: DiscuzCreditConfiguration | None = None
 
     @property
     def normalized_base_url(self) -> str:
@@ -90,6 +94,8 @@ class LoginResult:
     message: str
     login_method: str = "未登录"
     details: dict[str, str] = field(default_factory=dict)
+    credit_label: str = ""
+    credit_amount: str = ""
 
 
 @dataclass(frozen=True)
@@ -429,13 +435,19 @@ def strip_html(value: str) -> str:
     return normalize_text(re.sub(r"<[^>]+>", " ", message_source))
 
 
-def extract_credit_points(page_text: str) -> str:
-    plain_text = strip_html(page_text)
-    points_match = re.search(
-        r"(?:^|\s)积分\s*[:：]\s*([+-]?\d[\d,]*(?:\.\d+)?)",
-        plain_text,
+def extract_credit_amount(page_text: str, field_id: str) -> str:
+    credit_element_match = re.search(
+        rf"<(?P<tag>[a-z][\w:-]*)\b[^>]*\bid=[\"']{re.escape(field_id)}"
+        rf"[\"'][^>]*>(?P<content>.*?)</(?P=tag)>",
+        page_text,
+        flags=re.IGNORECASE | re.DOTALL,
     )
-    return points_match.group(1) if points_match else ""
+    if credit_element_match is None:
+        return ""
+
+    credit_text = strip_html(credit_element_match.group("content"))
+    amount_match = re.search(r"[+-]?\d[\d,]*(?:\.\d+)?", credit_text)
+    return amount_match.group(0) if amount_match else ""
 
 
 def contains_any(value: str, keywords: tuple[str, ...]) -> bool:
@@ -543,9 +555,8 @@ class DiscuzLoginClient:
             details: dict[str, str] = {}
             if username:
                 details["username"] = self._display_identifier(username)
-            credit_points = self._fetch_credit_points()
-            if credit_points:
-                details["points"] = credit_points
+            credit_amount = self._fetch_credit_amount()
+            credit_configuration = self.site.credit
             return LoginResult(
                 account_number=account_number,
                 account_label=account_label,
@@ -554,6 +565,12 @@ class DiscuzLoginClient:
                 message="每日登录状态已确认",
                 login_method=login_method,
                 details=details,
+                credit_label=(
+                    credit_configuration.display_name
+                    if credit_configuration and credit_amount
+                    else ""
+                ),
+                credit_amount=credit_amount,
             )
         except requests.Timeout:
             return self._failure_result(
@@ -800,10 +817,17 @@ class DiscuzLoginClient:
             return False, ""
         return True, extract_authenticated_username(page_text)
 
-    def _fetch_credit_points(self) -> str:
+    def _fetch_credit_amount(self) -> str:
+        credit_configuration = self.site.credit
+        if credit_configuration is None:
+            return ""
+
         try:
             response = self.session.get(
-                urljoin(self.site.normalized_base_url, CREDIT_PAGE_PATH),
+                urljoin(
+                    self.site.normalized_base_url,
+                    credit_configuration.page_path,
+                ),
                 timeout=self.timeout_seconds,
                 allow_redirects=True,
             )
@@ -812,12 +836,20 @@ class DiscuzLoginClient:
             print(f"[积分] 查询失败：{describe_request_error(error)}")
             return ""
 
-        credit_points = extract_credit_points(decode_html_response(response))
-        if credit_points:
-            print(f"[积分] 当前积分：{credit_points}")
+        credit_amount = extract_credit_amount(
+            decode_html_response(response),
+            credit_configuration.field_id,
+        )
+        if credit_amount:
+            print(
+                f"[积分] 当前{credit_configuration.display_name}："
+                f"{credit_amount}",
+            )
         else:
-            print("[积分] 积分页面中未找到余额")
-        return credit_points
+            print(
+                f"[积分] 页面中未找到字段 {credit_configuration.field_id}",
+            )
+        return credit_amount
 
     def _display_identifier(self, identifier: str) -> str:
         if not self.privacy_mode:
@@ -918,10 +950,14 @@ def build_notification_content(
             username = result.details["username"]
             html_account_lines.append(f"• 用户名：{html_code(username)}")
             plain_account_lines.append(f"• 用户名：{username}")
-        if result.details.get("points"):
-            credit_points = result.details["points"]
-            html_account_lines.append(f"• 积分：{html_code(credit_points)}")
-            plain_account_lines.append(f"• 积分：{credit_points}")
+        if result.credit_label and result.credit_amount:
+            escaped_credit_label = escape_html_text(result.credit_label)
+            html_account_lines.append(
+                f"• {escaped_credit_label}：{html_code(result.credit_amount)}",
+            )
+            plain_account_lines.append(
+                f"• {result.credit_label}：{result.credit_amount}",
+            )
         html_sections.append("\n".join(html_account_lines))
         plain_sections.append("\n".join(plain_account_lines))
 
@@ -1017,11 +1053,12 @@ def print_result(result: LoginResult) -> None:
     print(f"  说明：{result.message}")
     detail_labels = {
         "username": "用户名",
-        "points": "积分",
     }
     for detail_name, detail_value in result.details.items():
         detail_label = detail_labels.get(detail_name, detail_name)
         print(f"  {detail_label}：{detail_value}")
+    if result.credit_label and result.credit_amount:
+        print(f"  {result.credit_label}：{result.credit_amount}")
 
 
 def run_discuz_login(site: DiscuzSiteConfiguration) -> int:
