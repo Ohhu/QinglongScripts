@@ -14,8 +14,8 @@ comm/
 “黑名单”和“依赖文件”，以便入口脚本可以导入，但不生成无效任务。
 
 ```text
-黑名单：^comm/(cookie_store|discuz_login_common|task_runtime|token_store)\.py$
-依赖文件：^comm/(cookie_store|discuz_login_common|task_runtime|token_store)\.py$
+黑名单：^comm/.*\.py$
+依赖文件：^comm/.*\.py$
 ```
 
 Cookie 存储模块会根据调用方传入的存储名称创建独立文件。当前使用 Cookie
