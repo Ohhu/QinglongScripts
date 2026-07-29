@@ -10,7 +10,7 @@ new Env('HiFi 音乐站签到')
                         Cookie 优先；Cookie 失效后，配置了用户名密码才会回退登录。
                         仅 Cookie：域名|Cookie
                         仅账号密码：域名||用户名|密码
-                        hifiii.com 当前强制滑块，密码回退通常会失败，应优先维护 Cookie。
+                        hifiii.com 会自动识别并完成拼图验证。
   HIFI_NOTIFY           是否发送通知，默认为 true。
   HIFI_PRIVACY_MODE     日志和通知中是否对用户名脱敏，默认为 true。
   HIFI_USER_AGENT       可选。覆盖默认浏览器 User-Agent。
@@ -25,17 +25,25 @@ new Env('HiFi 音乐站签到')
 /ql/data/scripts_data/hifini_cookies.json，后续运行优先复用。
 
 通知优先使用 Telegram HTML 直发；失败或未配置时回退青龙纯文本通知。
+
+账号密码登录遇到拼图验证时，需要在青龙“依赖管理 -> Python3”中安装：
+  Pillow
+  pycryptodome
 """
 
 from __future__ import annotations
 
+import base64
 import builtins
 import hashlib
 import html
+import io
 import json
 import os
 import re
 import sys
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from html import unescape
@@ -63,11 +71,17 @@ DEFAULT_RANDOM_DELAY_MAX_SECONDS = 3600.0
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
+    "Chrome/144.0.0.0 Safari/537.36"
 )
 
 LOGIN_PATH = "/user-login.htm"
 SIGN_PATH = "/sg_sign.htm"
+CAPTCHA_GET_PATH = "/captcha_get.htm"
+CAPTCHA_CHECK_PATH = "/captcha_check.htm"
+CAPTCHA_TYPE = "blockPuzzle"
+CAPTCHA_MAX_ATTEMPTS = 3
+CAPTCHA_POINT_Y_COORDINATE = 5
+CAPTCHA_OPAQUE_ALPHA_THRESHOLD = 200
 
 USER_ID_PATTERN = re.compile(r"\bvar\s+uid\s*=\s*(\d+)\s*;", re.IGNORECASE)
 USERNAME_LINK_PATTERN = re.compile(
@@ -117,6 +131,13 @@ class AuthenticationResult:
     login_method: str
     username: str = ""
     message: str = ""
+
+
+@dataclass(frozen=True)
+class CaptchaVerificationResult:
+    token: str
+    encrypted_point_json: str
+    horizontal_offset: int
 
 
 class HifiCheckinClient:
@@ -337,20 +358,35 @@ class HifiCheckinClient:
         password_digest = hashlib.md5(
             self.configuration.password.encode("utf-8"),
         ).hexdigest()
-        response = self.session.post(
+
+        login_page_response = self.session.get(
             login_url,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": self.base_url.rstrip("/"),
-                "Referer": login_url,
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            data={
-                "email": self.configuration.username,
-                "password": password_digest,
-            },
             timeout=self.timeout_seconds,
             verify=False,
+        )
+        if login_page_response.status_code == 403:
+            return AuthenticationResult(
+                success=False,
+                login_method="账号密码",
+                message="HTTP 403，站点拒绝当前网络或请求特征",
+            )
+        login_page_response.raise_for_status()
+
+        captcha_result: CaptchaVerificationResult | None = None
+        if login_page_requires_captcha(login_page_response.text):
+            try:
+                captcha_result = self._complete_slider_captcha(login_url)
+            except ValueError as error:
+                return AuthenticationResult(
+                    success=False,
+                    login_method="账号密码",
+                    message=f"拼图验证失败：{error}",
+                )
+
+        response = self._submit_password_login(
+            login_url,
+            password_digest,
+            captcha_result,
         )
 
         if response.status_code == 403:
@@ -365,14 +401,47 @@ class HifiCheckinClient:
         response_code = response_data.get("code")
         response_message = clean_message(response_data.get("message"))
 
-        if response_code == "captcha" or contains_any(
-            response_message,
-            ("人机验证", "验证码", "滑块"),
+        if (
+            captcha_result is None
+            and is_captcha_required(response_code, response_message)
         ):
+            try:
+                captcha_result = self._complete_slider_captcha(login_url)
+            except ValueError as error:
+                return AuthenticationResult(
+                    success=False,
+                    login_method="账号密码",
+                    message=f"拼图验证失败：{error}",
+                )
+
+            response = self._submit_password_login(
+                login_url,
+                password_digest,
+                captcha_result,
+            )
+            if response.status_code == 403:
+                return AuthenticationResult(
+                    success=False,
+                    login_method="账号密码",
+                    message="HTTP 403，站点拒绝当前网络或请求特征",
+                )
+            response.raise_for_status()
+            response_data = parse_json_response(response.text)
+            response_code = response_data.get("code")
+            response_message = clean_message(response_data.get("message"))
+
+            if is_captcha_required(response_code, response_message):
+                return AuthenticationResult(
+                    success=False,
+                    login_method="账号密码",
+                    message=response_message or "登录接口未接受已通过的拼图验证",
+                )
+
+        if is_captcha_required(response_code, response_message):
             return AuthenticationResult(
                 success=False,
                 login_method="账号密码",
-                message="站点要求滑动人机验证，无法使用纯 HTTP 账号密码回退",
+                message=response_message or "登录接口未接受已通过的拼图验证",
             )
 
         if not is_success_code(response_code):
@@ -399,6 +468,160 @@ class HifiCheckinClient:
             username=username or self.configuration.username,
             message=response_message or "登录成功",
         )
+
+    def _submit_password_login(
+        self,
+        login_url: str,
+        password_digest: str,
+        captcha_result: CaptchaVerificationResult | None = None,
+    ) -> requests.Response:
+        login_form = {
+            "email": self.configuration.username,
+            "password": password_digest,
+        }
+        if captcha_result is not None:
+            login_form.update(
+                {
+                    "xn_token": captcha_result.token,
+                    "xn_pointJson": captcha_result.encrypted_point_json,
+                }
+            )
+
+        return self.session.post(
+            login_url,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": self.base_url.rstrip("/"),
+                "Referer": login_url,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            data=login_form,
+            timeout=self.timeout_seconds,
+            verify=False,
+        )
+
+    def _complete_slider_captcha(
+        self,
+        login_url: str,
+    ) -> CaptchaVerificationResult:
+        ensure_captcha_dependencies_available()
+
+        client_uid = f"slider-{uuid.uuid4()}"
+        last_failure_message = "站点未接受拼图位置"
+
+        for attempt_number in range(1, CAPTCHA_MAX_ATTEMPTS + 1):
+            challenge_data = self._request_captcha_challenge(
+                client_uid,
+                login_url,
+            )
+            horizontal_offset = find_slider_horizontal_offset(
+                challenge_data["originalImageBase64"],
+                challenge_data["jigsawImageBase64"],
+            )
+            encrypted_point_json = encrypt_captcha_point(
+                horizontal_offset,
+                challenge_data["secretKey"],
+            )
+            captcha_result = CaptchaVerificationResult(
+                token=challenge_data["token"],
+                encrypted_point_json=encrypted_point_json,
+                horizontal_offset=horizontal_offset,
+            )
+
+            verification_response = self.session.post(
+                build_url(self.base_url, CAPTCHA_CHECK_PATH),
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Content-Type": "application/json;charset=UTF-8",
+                    "Origin": self.base_url.rstrip("/"),
+                    "Referer": login_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                json={
+                    "captchaType": CAPTCHA_TYPE,
+                    "pointJson": captcha_result.encrypted_point_json,
+                    "token": captcha_result.token,
+                    "clientUid": client_uid,
+                    "ts": current_timestamp_milliseconds(),
+                },
+                timeout=self.timeout_seconds,
+                verify=False,
+            )
+            if verification_response.status_code == 403:
+                raise ValueError("拼图校验接口返回 HTTP 403")
+            verification_response.raise_for_status()
+
+            verification_data = parse_json_response(verification_response.text)
+            if verification_data.get("repCode") == "0000":
+                print(
+                    "[登录] 拼图验证成功："
+                    f"第 {attempt_number} 次，位置 x={horizontal_offset}",
+                )
+                return captcha_result
+
+            last_failure_message = clean_message(
+                verification_data.get("repMsg"),
+            ) or f"repCode={verification_data.get('repCode')!r}"
+            print(
+                "[登录] 拼图验证未通过："
+                f"第 {attempt_number} 次，{last_failure_message}",
+            )
+
+        raise ValueError(
+            f"连续 {CAPTCHA_MAX_ATTEMPTS} 次校验未通过：{last_failure_message}",
+        )
+
+    def _request_captcha_challenge(
+        self,
+        client_uid: str,
+        login_url: str,
+    ) -> dict[str, str]:
+        challenge_response = self.session.post(
+            build_url(self.base_url, CAPTCHA_GET_PATH),
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/json;charset=UTF-8",
+                "Origin": self.base_url.rstrip("/"),
+                "Referer": login_url,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            json={
+                "captchaType": CAPTCHA_TYPE,
+                "clientUid": client_uid,
+                "ts": current_timestamp_milliseconds(),
+            },
+            timeout=self.timeout_seconds,
+            verify=False,
+        )
+        if challenge_response.status_code == 403:
+            raise ValueError("拼图获取接口返回 HTTP 403")
+        challenge_response.raise_for_status()
+
+        challenge_payload = parse_json_response(challenge_response.text)
+        if challenge_payload.get("repCode") != "0000":
+            challenge_message = clean_message(challenge_payload.get("repMsg"))
+            raise ValueError(
+                challenge_message
+                or f"拼图获取失败，repCode={challenge_payload.get('repCode')!r}",
+            )
+
+        challenge_data = challenge_payload.get("repData")
+        if not isinstance(challenge_data, dict):
+            raise ValueError("拼图接口缺少 repData")
+
+        required_fields = (
+            "originalImageBase64",
+            "jigsawImageBase64",
+            "secretKey",
+            "token",
+        )
+        normalized_challenge: dict[str, str] = {}
+        for field_name in required_fields:
+            field_value = challenge_data.get(field_name)
+            if not isinstance(field_value, str) or not field_value:
+                raise ValueError(f"拼图接口缺少 {field_name}")
+            normalized_challenge[field_name] = field_value
+        return normalized_challenge
 
     def _submit_checkin(self) -> dict[str, Any]:
         sign_url = build_url(self.base_url, SIGN_PATH)
@@ -471,6 +694,158 @@ def origin_from_url(url: str) -> str:
 
 def build_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def current_timestamp_milliseconds() -> int:
+    return int(time.time() * 1000)
+
+
+def is_captcha_required(response_code: Any, response_message: str) -> bool:
+    return response_code == "captcha" or contains_any(
+        response_message,
+        ("人机验证", "验证码", "滑块"),
+    )
+
+
+def login_page_requires_captcha(page_text: str) -> bool:
+    has_captcha_endpoint = CAPTCHA_GET_PATH in page_text
+    has_captcha_form_fields = (
+        'name="xn_token"' in page_text
+        and 'name="xn_pointJson"' in page_text
+    )
+    return has_captcha_endpoint or has_captcha_form_fields
+
+
+def load_captcha_dependencies() -> tuple[Any, Any, Any]:
+    try:
+        from PIL import Image as pillow_image
+    except ImportError as error:
+        raise ValueError(
+            "缺少 Python3 依赖 Pillow，请在青龙依赖管理中安装",
+        ) from error
+
+    try:
+        from Crypto.Cipher import AES as aes_cipher
+        from Crypto.Util.Padding import pad as pad_bytes
+    except ImportError as error:
+        raise ValueError(
+            "缺少 Python3 依赖 pycryptodome，请在青龙依赖管理中安装",
+        ) from error
+
+    return pillow_image, aes_cipher, pad_bytes
+
+
+def ensure_captcha_dependencies_available() -> None:
+    load_captcha_dependencies()
+
+
+def decode_base64_png_to_rgba(
+    encoded_image: str,
+) -> tuple[int, int, bytes]:
+    pillow_image, _, _ = load_captcha_dependencies()
+
+    try:
+        image_bytes = base64.b64decode(encoded_image, validate=True)
+        with pillow_image.open(io.BytesIO(image_bytes)) as source_image:
+            rgba_image = source_image.convert("RGBA")
+            return rgba_image.width, rgba_image.height, rgba_image.tobytes()
+    except Exception as error:
+        raise ValueError(f"无法解码拼图 PNG：{type(error).__name__}") from error
+
+
+def find_slider_horizontal_offset(
+    original_image_base64: str,
+    jigsaw_image_base64: str,
+) -> int:
+    original_width, original_height, original_pixels = decode_base64_png_to_rgba(
+        original_image_base64,
+    )
+    jigsaw_width, jigsaw_height, jigsaw_pixels = decode_base64_png_to_rgba(
+        jigsaw_image_base64,
+    )
+
+    if original_height != jigsaw_height:
+        raise ValueError(
+            "拼图尺寸异常：原图与拼图块高度不一致",
+        )
+    if jigsaw_width <= 0 or jigsaw_width > original_width:
+        raise ValueError("拼图尺寸异常：拼图块宽度无效")
+
+    opaque_pixel_coordinates: list[tuple[int, int, int]] = []
+    for vertical_index in range(jigsaw_height):
+        for horizontal_index in range(jigsaw_width):
+            pixel_index = (
+                vertical_index * jigsaw_width + horizontal_index
+            ) * 4
+            alpha_value = jigsaw_pixels[pixel_index + 3]
+            if alpha_value > CAPTCHA_OPAQUE_ALPHA_THRESHOLD:
+                opaque_pixel_coordinates.append(
+                    (horizontal_index, vertical_index, pixel_index),
+                )
+
+    if not opaque_pixel_coordinates:
+        raise ValueError("拼图块没有可用于匹配的不透明像素")
+
+    best_horizontal_offset = 0
+    smallest_mean_color_difference = float("inf")
+    maximum_horizontal_offset = original_width - jigsaw_width
+
+    for candidate_offset in range(maximum_horizontal_offset + 1):
+        total_color_difference = 0
+        for (
+            piece_horizontal_index,
+            piece_vertical_index,
+            piece_pixel_index,
+        ) in opaque_pixel_coordinates:
+            original_pixel_index = (
+                piece_vertical_index * original_width
+                + candidate_offset
+                + piece_horizontal_index
+            ) * 4
+            total_color_difference += abs(
+                jigsaw_pixels[piece_pixel_index]
+                - original_pixels[original_pixel_index],
+            )
+            total_color_difference += abs(
+                jigsaw_pixels[piece_pixel_index + 1]
+                - original_pixels[original_pixel_index + 1],
+            )
+            total_color_difference += abs(
+                jigsaw_pixels[piece_pixel_index + 2]
+                - original_pixels[original_pixel_index + 2],
+            )
+
+        mean_color_difference = total_color_difference / (
+            len(opaque_pixel_coordinates) * 3
+        )
+        if mean_color_difference < smallest_mean_color_difference:
+            smallest_mean_color_difference = mean_color_difference
+            best_horizontal_offset = candidate_offset
+
+    return best_horizontal_offset
+
+
+def encrypt_captcha_point(horizontal_offset: int, secret_key: str) -> str:
+    _, aes_cipher, pad_bytes = load_captcha_dependencies()
+    secret_key_bytes = secret_key.encode("utf-8")
+    if len(secret_key_bytes) not in {16, 24, 32}:
+        raise ValueError("拼图接口返回的 AES 密钥长度无效")
+
+    point_json = json.dumps(
+        {
+            "x": horizontal_offset,
+            "y": CAPTCHA_POINT_Y_COORDINATE,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encrypted_point = aes_cipher.new(
+        secret_key_bytes,
+        aes_cipher.MODE_ECB,
+    ).encrypt(
+        pad_bytes(point_json, aes_cipher.block_size),
+    )
+    return base64.b64encode(encrypted_point).decode("ascii")
 
 
 def load_cookie_header(session: requests.Session, cookie_header: str) -> None:
