@@ -27,6 +27,7 @@ Cookie 存储模块会根据调用方传入的存储名称创建独立文件。�
 /ql/data/scripts_data/hifini_cookies.json
 /ql/data/scripts_data/soushuba_login_cookies.json
 /ql/data/scripts_data/mt_cookies.json
+/ql/data/scripts_data/qmj_cookies.json
 ```
 
 每个文件可以保存该任务下的多个账号。写入采用锁文件和原子替换，避免同一
