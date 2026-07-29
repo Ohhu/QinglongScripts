@@ -17,7 +17,6 @@ new Env('阡陌居签到')
                         配置后使用 HTML 直发，失败回退青龙纯文本通知。
   TASK_RANDOM_SIGNIN    是否启用启动前随机延迟，默认为 true（所有任务共用）。
   TASK_RANDOM_DELAY_MAX 随机延迟的最大秒数，默认为 3600（所有任务共用）。
-  TASK_TIMEOUT          单次请求超时秒数，默认为 90（所有任务共用）。
   TASK_ACCOUNT_DELAY    多账号之间的等待秒数，默认为 3（所有任务共用）。
 
 账号密码登录通过 Discuz 移动 API 完成，不经过网页端顶象滑块。登录成功或
@@ -62,7 +61,7 @@ SIGN_ENDPOINT_URL = urljoin(BASE_URL, "plugin.php")
 TASK_APPLY_URL = urljoin(BASE_URL, "home.php")
 CREDIT_PAGE_URL = urljoin(BASE_URL, "home.php?mod=spacecp&ac=credit")
 
-DEFAULT_REQUEST_TIMEOUT_SECONDS = 90.0
+REQUEST_TIMEOUT_SECONDS = 90.0
 DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
 DEFAULT_SIGN_MOOD = "wl"
 TASK_IDENTIFIER = "1"
@@ -939,7 +938,6 @@ def main() -> int:
         print(f"[配置错误] {configuration_error}")
 
     runtime_settings = load_task_runtime_settings(
-        default_request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
         default_account_delay_seconds=DEFAULT_ACCOUNT_DELAY_SECONDS,
     )
     privacy_mode = read_boolean_environment("QMJ_PRIVACY_MODE", True)
@@ -961,7 +959,7 @@ def main() -> int:
         print(f"\n---- 账号 {account_number}（{account_label}）开始 ----")
         client = QianmojuCheckinClient(
             configuration=configuration,
-            request_timeout_seconds=runtime_settings.request_timeout_seconds,
+            request_timeout_seconds=REQUEST_TIMEOUT_SECONDS,
             sign_mood=sign_mood,
             privacy_mode=privacy_mode,
         )
@@ -987,7 +985,7 @@ def main() -> int:
             notification_title,
             html_content,
             plain_content,
-            runtime_settings.request_timeout_seconds,
+            REQUEST_TIMEOUT_SECONDS,
         )
     else:
         print("[通知] QMJ_NOTIFY 已关闭，跳过通知")
