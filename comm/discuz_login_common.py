@@ -10,6 +10,7 @@ import html
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
@@ -93,10 +94,18 @@ class LoginForm:
     hidden_fields: dict[str, str]
     field_names: frozenset[str]
     captcha_image_url: str = ""
+    captcha_hash: str = ""
+    captcha_module_id: str = ""
 
     @property
     def requires_captcha(self) -> bool:
-        return "seccodeverify" in self.field_names
+        return "seccodeverify" in self.field_names or bool(self.captcha_hash)
+
+
+@dataclass(frozen=True)
+class CaptchaChallenge:
+    image_url: str
+    hidden_fields: dict[str, str]
 
 
 class LoginFormParser(HTMLParser):
@@ -154,6 +163,40 @@ class LoginFormParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "form" and self._inside_login_form:
             self._inside_login_form = False
+
+
+class CaptchaUpdateParser(HTMLParser):
+    """解析 Discuz 验证码更新接口返回的 JavaScript 内嵌标签。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.hidden_fields: dict[str, str] = {}
+        self.image_source = ""
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attributes: list[tuple[str, str | None]],
+    ) -> None:
+        normalized_tag = tag.lower()
+        attribute_map = {
+            name.lower(): value or ""
+            for name, value in attributes
+        }
+
+        if normalized_tag == "input":
+            field_name = attribute_map.get("name", "")
+            if (
+                attribute_map.get("type", "").lower() == "hidden"
+                and field_name in {"seccodehash", "seccodemodid"}
+            ):
+                self.hidden_fields[field_name] = attribute_map.get("value", "")
+            return
+
+        if normalized_tag == "img":
+            image_source = attribute_map.get("src", "")
+            if "mod=seccode" in image_source:
+                self.image_source = image_source
 
 
 class AuthenticatedPageParser(HTMLParser):
@@ -278,6 +321,18 @@ def parse_login_form(page_text: str, page_url: str) -> LoginForm:
     if not parser.action:
         raise ValueError("登录页结构已变化，未找到登录表单")
 
+    dynamic_captcha_match = re.search(
+        r"updateseccode\(\s*['\"](?P<captcha_hash>[^'\"]+)['\"]\s*,"
+        r".*?,\s*['\"](?P<module_id>[^'\"]+)['\"]\s*\)",
+        page_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    captcha_hash = parser.hidden_fields.get("seccodehash", "")
+    captcha_module_id = parser.hidden_fields.get("seccodemodid", "")
+    if dynamic_captcha_match:
+        captcha_hash = dynamic_captcha_match.group("captcha_hash")
+        captcha_module_id = dynamic_captcha_match.group("module_id")
+
     captcha_image_url = ""
     if parser.captcha_image_url:
         captcha_image_url = urljoin(page_url, parser.captcha_image_url)
@@ -287,6 +342,27 @@ def parse_login_form(page_text: str, page_url: str) -> LoginForm:
         hidden_fields=parser.hidden_fields,
         field_names=frozenset(parser.field_names),
         captcha_image_url=captcha_image_url,
+        captcha_hash=captcha_hash,
+        captcha_module_id=captcha_module_id,
+    )
+
+
+def parse_captcha_update(
+    update_text: str,
+    update_url: str,
+) -> CaptchaChallenge:
+    parser = CaptchaUpdateParser()
+    parser.feed(update_text)
+    if not parser.image_source:
+        raise ValueError("登录页要求验证码，但验证码更新响应中未找到图片")
+
+    required_hidden_fields = {"seccodehash", "seccodemodid"}
+    if not required_hidden_fields.issubset(parser.hidden_fields):
+        raise ValueError("登录页要求验证码，但验证码更新响应缺少必要字段")
+
+    return CaptchaChallenge(
+        image_url=urljoin(update_url, html.unescape(parser.image_source)),
+        hidden_fields=parser.hidden_fields,
     )
 
 
@@ -569,16 +645,20 @@ class DiscuzLoginClient:
             if login_form.requires_captcha:
                 if not self.ocr_key:
                     return False, "", "登录页要求验证码，但未配置 OCR_KEY"
-                if not login_form.captcha_image_url:
-                    return False, "", "登录页要求验证码，但未找到验证码图片"
+
+                captcha_challenge = self._load_login_captcha_challenge(
+                    login_form,
+                    login_page_response.url,
+                )
 
                 captcha_text = self._recognize_login_captcha(
-                    login_form.captcha_image_url,
+                    captcha_challenge.image_url,
                     login_page_response.url,
                 )
                 if not captcha_text:
                     last_message = f"第 {attempt_number} 次验证码识别失败"
                     continue
+                login_payload.update(captcha_challenge.hidden_fields)
                 login_payload["seccodeverify"] = captcha_text
 
             login_response = self.session.post(
@@ -613,6 +693,61 @@ class DiscuzLoginClient:
             break
 
         return False, "", f"登录失败：{last_message}"
+
+    def _load_login_captcha_challenge(
+        self,
+        login_form: LoginForm,
+        login_page_url: str,
+    ) -> CaptchaChallenge:
+        captcha_hidden_fields = {
+            field_name: field_value
+            for field_name, field_value in login_form.hidden_fields.items()
+            if field_name in {"seccodehash", "seccodemodid"}
+        }
+        if login_form.captcha_hash:
+            captcha_hidden_fields.setdefault(
+                "seccodehash",
+                login_form.captcha_hash,
+            )
+        if login_form.captcha_module_id:
+            captcha_hidden_fields.setdefault(
+                "seccodemodid",
+                login_form.captcha_module_id,
+            )
+
+        if login_form.captcha_image_url:
+            required_hidden_fields = {"seccodehash", "seccodemodid"}
+            if not required_hidden_fields.issubset(captcha_hidden_fields):
+                raise ValueError("登录页要求验证码，但验证码表单缺少必要字段")
+            return CaptchaChallenge(
+                image_url=login_form.captcha_image_url,
+                hidden_fields=captcha_hidden_fields,
+            )
+
+        if not login_form.captcha_hash or not login_form.captcha_module_id:
+            raise ValueError("登录页要求验证码，但未找到验证码动态加载参数")
+
+        print("[验证码] 检测到动态验证码，正在加载验证码图片")
+        update_response = self.session.get(
+            urljoin(login_page_url, "misc.php"),
+            params={
+                "mod": "seccode",
+                "action": "update",
+                "idhash": login_form.captcha_hash,
+                "modid": login_form.captcha_module_id,
+                "_": str(time.time_ns()),
+            },
+            headers={
+                "Referer": login_page_url,
+                "Accept": "application/javascript,*/*;q=0.8",
+            },
+            timeout=self.timeout_seconds,
+        )
+        update_response.raise_for_status()
+        return parse_captcha_update(
+            decode_html_response(update_response),
+            update_response.url,
+        )
 
     def _recognize_login_captcha(
         self,
