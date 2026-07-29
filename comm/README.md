@@ -6,19 +6,20 @@
 comm/
 ├── cookie_store.py          通用 Cookie 持久化存储
 ├── discuz_login_common.py   Discuz 论坛登录、验证及通知实现
-└── task_runtime.py          通用任务配置、随机延迟和账号间隔
+├── task_runtime.py          通用任务配置、随机延迟和账号间隔
+└── token_store.py           通用访问令牌和刷新令牌持久化存储
 ```
 
 这些文件不应由青龙自动创建为定时任务。仓库订阅需要把它们同时配置为
 “黑名单”和“依赖文件”，以便入口脚本可以导入，但不生成无效任务。
 
 ```text
-黑名单：^comm/(cookie_store|discuz_login_common|task_runtime)\.py$
-依赖文件：^comm/(cookie_store|discuz_login_common|task_runtime)\.py$
+黑名单：^comm/(cookie_store|discuz_login_common|task_runtime|token_store)\.py$
+依赖文件：^comm/(cookie_store|discuz_login_common|task_runtime|token_store)\.py$
 ```
 
-Cookie 存储模块会根据调用方传入的存储名称创建独立文件。当前 Discuz 登录
-及签到任务分别使用：
+Cookie 存储模块会根据调用方传入的存储名称创建独立文件。当前使用 Cookie
+持久化的登录及签到任务分别使用：
 
 ```text
 /ql/data/scripts_data/livecodes_login_cookies.json
@@ -28,6 +29,13 @@ Cookie 存储模块会根据调用方传入的存储名称创建独立文件。�
 /ql/data/scripts_data/soushuba_login_cookies.json
 /ql/data/scripts_data/mt_cookies.json
 /ql/data/scripts_data/qmj_cookies.json
+/ql/data/scripts_data/mikoto_tv_cookies.json
+```
+
+MiraiEmby 使用访问令牌和刷新令牌而不是登录 Cookie，保存在：
+
+```text
+/ql/data/scripts_data/miraiemby_tokens.json
 ```
 
 每个文件可以保存该任务下的多个账号。写入采用锁文件和原子替换，避免同一
