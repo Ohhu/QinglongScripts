@@ -203,45 +203,43 @@ class RainFlowCheckinClient:
 
 
 def is_already_checked_in(status_payload: dict[str, Any]) -> bool:
-    for field_name in ("checked_in", "checkedIn", "is_checked_in", "has_checked_in", "today_checked"):
-        field_value = status_payload.get(field_name)
-        if isinstance(field_value, bool):
-            return field_value
+    checked_in_today = status_payload.get("checked_in_today")
+    if isinstance(checked_in_today, bool):
+        return checked_in_today
+    can_checkin = status_payload.get("can_checkin")
+    if isinstance(can_checkin, bool):
+        return not can_checkin
     return False
 
 
 def build_checkin_details(status_payload: dict[str, Any]) -> dict[str, str]:
     details: dict[str, str] = {}
-    field_labels = {
-        "continuous_days": "连续签到",
-        "continuousCheckinDays": "连续签到",
-        "checkin_days": "累计签到",
-        "total_checkin_days": "累计签到",
-        "balance": "余额",
-        "quota": "额度",
-        "used_quota": "已用额度",
-        "reward": "签到奖励",
-        "last_checkin_time": "上次签到",
-        "lastCheckinTime": "上次签到",
-        "today_reward": "今日奖励",
-    }
-    for field_name, field_label in field_labels.items():
-        field_value = status_payload.get(field_name)
-        if isinstance(field_value, bool) or field_value is None:
-            continue
-        if isinstance(field_value, (int, float)):
-            details[field_label] = format_detail_value(field_name, field_value)
-        elif isinstance(field_value, str) and field_value.strip():
-            details[field_label] = field_value.strip()
+
+    points = status_payload.get("points")
+    if isinstance(points, dict):
+        balance = points.get("balance")
+        if isinstance(balance, (int, float)) and not isinstance(balance, bool):
+            details["积分余额"] = f"{balance:g}"
+
+    today_points = status_payload.get("today_points")
+    if isinstance(today_points, (int, float)) and not isinstance(today_points, bool):
+        details["今日积分"] = f"{today_points:g}"
+
+    recent_checkins = status_payload.get("recent_checkins")
+    if isinstance(recent_checkins, list) and len(recent_checkins) > 1:
+        consecutive_days = 0
+        for checkin in recent_checkins:
+            if isinstance(checkin, dict) and checkin.get("checkin_date"):
+                consecutive_days += 1
+            else:
+                break
+        details["近期连续"] = f"{consecutive_days} 天"
+
+    at_balance_cap = status_payload.get("at_balance_cap")
+    if at_balance_cap is True:
+        details["提示"] = "已达积分上限"
+
     return details
-
-
-def format_detail_value(field_name: str, value: float) -> str:
-    if "quota" in field_name or field_name == "balance":
-        return f"{value / 500000:g} 美元" if value >= 500000 else str(value)
-    if "days" in field_name:
-        return f"{int(value)} 天"
-    return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
 def extract_reward_message(checkin_payload: dict[str, Any]) -> str:
@@ -249,9 +247,17 @@ def extract_reward_message(checkin_payload: dict[str, Any]) -> str:
         field_value = checkin_payload.get(field_name)
         if isinstance(field_value, str) and field_value.strip():
             return field_value.strip()
-    reward = checkin_payload.get("reward")
-    if isinstance(reward, (int, float)) and not isinstance(reward, bool):
-        return f"获得奖励 {format_detail_value('reward', reward)}"
+    points_awarded = checkin_payload.get("points_awarded")
+    if isinstance(points_awarded, (int, float)) and not isinstance(points_awarded, bool):
+        return f"获得 {points_awarded:g} 积分"
+    points = checkin_payload.get("points")
+    if isinstance(points, (int, float)) and not isinstance(points, bool):
+        return f"获得 {points:g} 积分"
+    checkin_record = checkin_payload.get("checkin")
+    if isinstance(checkin_record, dict):
+        record_points = checkin_record.get("points")
+        if isinstance(record_points, (int, float)) and not isinstance(record_points, bool):
+            return f"获得 {record_points:g} 积分"
     return ""
 
 
