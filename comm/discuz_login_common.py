@@ -21,6 +21,10 @@ from urllib.parse import urljoin
 import requests
 
 from comm.cookie_store import CookieStore
+from comm.ocr_client import (
+    has_ocr_key as _has_ocr_key,
+    recognize_captcha as _recognize_captcha,
+)
 from comm.task_runtime import (
     apply_startup_random_delay,
     load_task_runtime_settings,
@@ -29,7 +33,6 @@ from comm.task_runtime import (
 )
 
 
-EASYOCR_API_URL = "https://console.easyocr.org/api/ocr"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_ACCOUNT_DELAY_SECONDS = 3.0
 DEFAULT_RANDOM_DELAY_MAX_SECONDS = 3600.0
@@ -376,49 +379,6 @@ def parse_captcha_update(
     )
 
 
-def recognize_image_with_ocr(
-    ocr_key: str,
-    image_bytes: bytes,
-    image_filename: str,
-    timeout_seconds: float,
-) -> str | None:
-    try:
-        response = requests.post(
-            EASYOCR_API_URL,
-            headers={"X-Access-Key": ocr_key},
-            files={"file": (image_filename, image_bytes)},
-            timeout=timeout_seconds,
-        )
-        response_data = response.json()
-    except (requests.RequestException, ValueError) as error:
-        print(f"[OCR] 识别请求失败：{type(error).__name__}")
-        return None
-
-    if response.status_code != 200:
-        print(f"[OCR] 识别失败：HTTP {response.status_code}")
-        return None
-
-    words = response_data.get("words") or []
-    recognized_text = "".join(
-        str(word.get("text", ""))
-        for word in words
-        if isinstance(word, dict)
-    )
-    captcha_text = "".join(re.findall(r"[a-zA-Z0-9]", recognized_text))
-    if not captcha_text:
-        print(f"[OCR] 未识别到有效验证码：{response_data.get('result_summary')}")
-        return None
-
-    remaining_quota = response_data.get("remaining_quota")
-    quota_message = (
-        f"（剩余额度 {remaining_quota}）"
-        if remaining_quota is not None
-        else ""
-    )
-    print(f"[OCR] 已识别到 {len(captcha_text)} 位验证码{quota_message}")
-    return captcha_text
-
-
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
 
@@ -510,13 +470,11 @@ class DiscuzLoginClient:
         site: DiscuzSiteConfiguration,
         configuration: AccountConfiguration,
         timeout_seconds: float,
-        ocr_key: str,
         privacy_mode: bool,
     ) -> None:
         self.site = site
         self.configuration = configuration
         self.timeout_seconds = timeout_seconds
-        self.ocr_key = ocr_key
         self.privacy_mode = privacy_mode
         self.session = self._create_session()
         self.cookie_store = CookieStore(f"{site.site_key}_login_cookies")
@@ -677,7 +635,7 @@ class DiscuzLoginClient:
             }
 
             if login_form.requires_captcha:
-                if not self.ocr_key:
+                if not _has_ocr_key():
                     return False, "", "登录页要求验证码，但未配置 OCR_KEY"
 
                 captcha_challenge = self._load_login_captcha_challenge(
@@ -794,10 +752,8 @@ class DiscuzLoginClient:
             timeout=self.timeout_seconds,
         )
         image_response.raise_for_status()
-        return recognize_image_with_ocr(
-            self.ocr_key,
+        return _recognize_captcha(
             image_response.content,
-            "discuz-login-captcha.png",
             self.timeout_seconds,
         )
 
@@ -1090,7 +1046,6 @@ def run_discuz_login(site: DiscuzSiteConfiguration) -> int:
         has_work=bool(configurations),
     )
 
-    ocr_key = os.getenv("OCR_KEY", "").strip()
     results: list[LoginResult] = []
     for account_index, configuration in enumerate(configurations, start=1):
         configured_label = (
@@ -1103,7 +1058,6 @@ def run_discuz_login(site: DiscuzSiteConfiguration) -> int:
             site,
             configuration,
             timeout_seconds,
-            ocr_key,
             privacy_mode,
         )
         result = client.login(account_index)

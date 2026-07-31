@@ -6,6 +6,7 @@
 comm/
 ├── cookie_store.py          通用 Cookie 持久化存储
 ├── discuz_login_common.py   Discuz 论坛登录、验证及通知实现
+├── ocr_client.py            通用 OCR 识别（讯飞图像理解）
 ├── task_runtime.py          通用任务配置、随机延迟和账号间隔
 └── token_store.py           通用访问令牌和刷新令牌持久化存储
 ```

@@ -10,9 +10,8 @@ new Env('尚香书苑签到')
                          用户名|密码|Cookie  Cookie 优先，失效回退账密
                          第一列支持用户名或邮箱，自动识别（含 @ 视为邮箱）。
                          Cookie 优先级最高：整行不含 | 时视为纯 Cookie。
-  OCR_KEY              账密登录或自动域名发现时必填。EasyOCR 云端
-                       访问密钥（console.easyocr.org 创建，eocr_ 开头），
-                       所有需要 OCR 的任务共用。
+  OCR_KEY              账密登录或自动域名发现时必填。讯飞图像理解
+                       APIKey（服务管控页面获取），所有需要 OCR 的任务共用。
   SXSY_HOST            可选。手动指定站点域名（如 sxsy13.com），
                        设置后跳过发布页域名发现。
   SXSY_PRIVACY_MODE    日志和通知中是否对账号名脱敏，默认为 true。
@@ -25,7 +24,7 @@ new Env('尚香书苑签到')
 
 站点发布页 https://sxsy.org/ 把最新域名放在 site.jpg 图片里。
 脚本优先验证上次成功的域名缓存；缓存不可用时下载图片并使用
-EasyOCR 云端识别最新域名，再失败则使用内置默认域名。
+讯飞 OCR 识别最新域名，再失败则使用内置默认域名。
 
 Cookie 持久化：账密登录成功后把最新 Cookie 存入青龙数据目录
 （默认 /ql/data/scripts_data/sxsy_cookies.json），之后运行优先用本地
@@ -53,15 +52,17 @@ from urllib.parse import quote, urljoin, urlparse
 import requests
 
 from comm.cookie_store import CookieStore
+from comm.ocr_client import (
+    has_ocr_key as _ocr_has_key,
+    recognize_captcha as _ocr_recognize_captcha,
+    recognize_text as _ocr_recognize_text,
+)
 from comm.task_runtime import (
     apply_startup_random_delay,
     load_task_runtime_settings,
     read_boolean_environment,
     wait_between_accounts,
 )
-
-
-EASYOCR_API_URL = "https://console.easyocr.org/api/ocr"
 
 
 RELEASE_PAGE_URL = "https://sxsy.org/"
@@ -173,7 +174,6 @@ def parse_account_configurations(
 
 
 def discover_host_via_ocr(
-    ocr_key: str,
     timeout_seconds: float,
 ) -> str | None:
     image_url = urljoin(RELEASE_PAGE_URL, DOMAIN_IMAGE_PATH)
@@ -188,57 +188,23 @@ def discover_host_via_ocr(
         print(f"[域名发现] 下载域名图片失败：{describe_request_error(error)}")
         return None
 
-    recognized_text = recognize_image_with_ocr(
-        ocr_key,
+    recognized_text = _ocr_recognize_text(
         image_response.content,
-        "site.jpg",
-        timeout_seconds,
+        prompt=(
+            "图片中有一个网站域名，请识别并只输出该域名，"
+            "不要输出其他任何内容。注意区分数字1和字母l、数字0和字母o。"
+        ),
+        timeout_seconds=timeout_seconds,
     )
     if not recognized_text:
         return None
 
-    host_match = HOST_PATTERN.search(recognized_text.replace(" ", ""))
+    host_match = HOST_PATTERN.search(re.sub(r"\s+", "", recognized_text))
     if not host_match:
         print(f"[域名发现] OCR 结果中未找到域名：{recognized_text!r}")
         return None
 
     return host_match.group(0).lower()
-
-
-def recognize_image_with_ocr(
-    ocr_key: str,
-    image_bytes: bytes,
-    image_filename: str,
-    timeout_seconds: float,
-) -> str | None:
-    try:
-        response = requests.post(
-            EASYOCR_API_URL,
-            headers={"X-Access-Key": ocr_key},
-            files={"file": (image_filename, image_bytes)},
-            timeout=timeout_seconds,
-        )
-        response_data = response.json()
-    except (requests.RequestException, ValueError) as error:
-        print(f"[OCR] 识别请求失败：{type(error).__name__}")
-        return None
-
-    if response.status_code != 200:
-        print(f"[OCR] 识别失败：HTTP {response.status_code} {response_data}")
-        return None
-
-    words = response_data.get("words") or []
-    recognized_text = " ".join(
-        str(word.get("text", "")) for word in words
-    ).strip()
-    if not recognized_text:
-        print(f"[OCR] 未识别到文字：{response_data.get('result_summary')}")
-        return None
-
-    remaining_quota = response_data.get("remaining_quota")
-    if remaining_quota is not None:
-        print(f"[OCR] 识别成功：{recognized_text!r}（剩余额度 {remaining_quota}）")
-    return recognized_text
 
 
 def read_cached_host() -> str | None:
@@ -291,7 +257,6 @@ def validate_host(host: str, timeout_seconds: float) -> str | None:
 
 
 def resolve_host(
-    ocr_key: str,
     timeout_seconds: float,
 ) -> tuple[str, str | None]:
     configured_host = os.getenv("SXSY_HOST", "").strip()
@@ -313,12 +278,12 @@ def resolve_host(
             return validated_host, None
         print("[域名发现] 缓存域名不可用，重新从发布页识别")
 
-    if not ocr_key:
+    if not os.getenv("OCR_KEY", "").strip():
         error_message = "缓存域名不可用且未配置 OCR_KEY，无法自动发现最新域名"
         print(f"[域名发现] {error_message}，使用默认域名：{DEFAULT_HOST}")
         return DEFAULT_HOST, error_message
 
-    discovered_host = discover_host_via_ocr(ocr_key, timeout_seconds)
+    discovered_host = discover_host_via_ocr(timeout_seconds)
     if discovered_host:
         validated_host = validate_host(discovered_host, timeout_seconds)
         if validated_host:
@@ -338,12 +303,10 @@ class SxsyCheckinClient:
         self,
         configuration: AccountConfiguration,
         host: str,
-        ocr_key: str,
         timeout_seconds: float,
     ) -> None:
         self.configuration = configuration
         self.host = host
-        self.ocr_key = ocr_key
         self.timeout_seconds = timeout_seconds
         self.session = requests.Session()
         self.session.headers.update(
@@ -487,8 +450,6 @@ class SxsyCheckinClient:
 
         if not self.configuration.identifier or not self.configuration.password:
             return False, "Cookie", "Cookie 已失效且未配置账号密码"
-        if not self.ocr_key:
-            return False, "账号密码", "账密登录需要配置 OCR_KEY"
 
         self.session.cookies.clear()
         login_success, login_method, login_message = self._login_with_password()
@@ -584,6 +545,8 @@ class SxsyCheckinClient:
         return False, "账号密码", f"登录失败：{login_message or '未知原因'}"
 
     def _solve_captcha(self, seccode_hash: str) -> str:
+        if not _ocr_has_key():
+            return ""
         for attempt in range(1, CAPTCHA_MAX_ATTEMPTS + 1):
             captcha_response = self.session.get(
                 f"https://{self.host}/misc.php?mod=seccode"
@@ -597,10 +560,8 @@ class SxsyCheckinClient:
                 timeout=self.timeout_seconds,
             )
             captcha_response.raise_for_status()
-            captcha_text = recognize_image_with_ocr(
-                self.ocr_key,
+            captcha_text = _ocr_recognize_captcha(
                 captcha_response.content,
-                "captcha.jpg",
                 self.timeout_seconds,
             )
             if not captcha_text:
@@ -1002,11 +963,10 @@ def main() -> int:
     if not configurations and not configuration_errors:
         configuration_errors.append("未配置 SXSY_ACCOUNTS 环境变量")
 
-    ocr_key = os.getenv("OCR_KEY", "").strip()
     password_login_needs_ocr = any(
         configuration.password for configuration in configurations
     )
-    if password_login_needs_ocr and not ocr_key:
+    if password_login_needs_ocr and not os.getenv("OCR_KEY", "").strip():
         configuration_errors.append(
             "账密登录需要配置 OCR_KEY",
         )
@@ -1027,7 +987,7 @@ def main() -> int:
         has_work=bool(configurations),
     )
 
-    host, host_resolution_error = resolve_host(ocr_key, timeout_seconds)
+    host, host_resolution_error = resolve_host(timeout_seconds)
     if host_resolution_error:
         configuration_errors.append(host_resolution_error)
         print(f"[配置错误] {host_resolution_error}")
@@ -1040,7 +1000,7 @@ def main() -> int:
             else configuration.label
         )
         print(f"\n---- 账号 {account_index}（{display_label}）开始 ----")
-        client = SxsyCheckinClient(configuration, host, ocr_key, timeout_seconds)
+        client = SxsyCheckinClient(configuration, host, timeout_seconds)
         result = client.checkin(account_index)
         if privacy_mode:
             result.account_label = display_label

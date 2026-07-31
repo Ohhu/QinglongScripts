@@ -10,9 +10,9 @@ new Env('无损音乐论坛每日登录')
                          用户名|密码|Cookie
                          纯 Cookie
                         Cookie 优先；失效后，配置了账号密码才会回退登录。
-  OCR_KEY              账密登录遇到验证码时必填。EasyOCR 云端访问密钥
-                       （console.easyocr.org 创建，eocr_ 开头），所有 OCR
-                        任务共用。验证码识别失败时最多刷新重试 3 次。
+  OCR_KEY              账密登录遇到验证码时必填。讯飞图像理解 APIKey
+                        （服务管控页面获取），所有 OCR 任务共用。
+                        验证码识别失败时最多刷新重试 3 次。
   MC168_NOTIFY          是否发送通知，默认为 true。
   MC168_PRIVACY_MODE    日志和通知中是否对用户名脱敏，默认为 true。
   TG_NOTIFY_CONFIG      可选。统一 Telegram 配置：BotToken|ChatID|APIHost；
