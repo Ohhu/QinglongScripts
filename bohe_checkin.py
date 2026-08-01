@@ -105,20 +105,12 @@ class BoheCheckinClient:
                     str(spin_payload.get("message", "签到失败")),
                 )
 
-            spin_data = extract_checkin_status_data(spin_payload)
-            reward = extract_first_value(spin_data, ("quota", "reward", "amount"))
-            reward_text = "-" if reward is None else str(reward)
             message = str(spin_payload.get("message") or "转盘签到成功")
-            details = {
-                "获得额度": reward_text,
-                "说明": message,
-            }
             return CheckinResult(
                 success=True,
                 status="签到成功",
                 message=message,
                 username=username,
-                details=details,
             )
 
         except requests.Timeout:
