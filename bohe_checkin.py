@@ -84,20 +84,12 @@ class BoheCheckinClient:
         try:
             username = self._fetch_username()
             status_payload = self._fetch_checkin_status()
-            status_data = status_payload.get("data") or {}
+            status_data = extract_checkin_status_data(status_payload)
 
-            already_checked = bool(
-                status_data.get("checked_in_today")
-                or status_data.get("already_checked_in")
-                or status_data.get("has_checked_in")
-            )
-            if already_checked:
+            should_submit_spin = determine_should_submit_spin(status_data)
+            if not should_submit_spin:
                 details = {
-                    "今日已获额度": str(
-                        status_data.get("today_quota")
-                        or status_data.get("today_reward")
-                        or "-"
-                    ),
+                    "今日已获额度": extract_today_reward(status_data),
                 }
                 return CheckinResult(
                     success=True,
@@ -113,21 +105,18 @@ class BoheCheckinClient:
                     str(spin_payload.get("message", "签到失败")),
                 )
 
-            spin_data = spin_payload.get("data") or {}
-            reward = (
-                spin_data.get("quota")
-                or spin_data.get("reward")
-                or spin_data.get("amount")
-                or "-"
-            )
+            spin_data = extract_checkin_status_data(spin_payload)
+            reward = extract_first_value(spin_data, ("quota", "reward", "amount"))
+            reward_text = "-" if reward is None else str(reward)
+            message = str(spin_payload.get("message") or "转盘签到成功")
             details = {
-                "获得额度": str(reward),
-                "说明": str(spin_payload.get("message", "转盘签到成功")),
+                "获得额度": reward_text,
+                "说明": message,
             }
             return CheckinResult(
                 success=True,
                 status="签到成功",
-                message=str(spin_payload.get("message", f"获得 {reward} 额度")),
+                message=message,
                 username=username,
                 details=details,
             )
@@ -164,6 +153,7 @@ class BoheCheckinClient:
     def _get_json(self, path: str) -> dict[str, Any]:
         response = self.session.get(
             f"{BASE_URL}{path}",
+            headers={"Referer": f"{BASE_URL}/"},
             timeout=self.timeout_seconds,
             verify=False,
         )
@@ -173,6 +163,11 @@ class BoheCheckinClient:
         response = self.session.post(
             f"{BASE_URL}{path}",
             json={},
+            headers={
+                "Content-Type": "application/json",
+                "Origin": BASE_URL,
+                "Referer": f"{BASE_URL}/",
+            },
             timeout=self.timeout_seconds,
             verify=False,
         )
@@ -187,8 +182,13 @@ class BoheCheckinClient:
                 f"接口返回非 JSON（HTTP {response.status_code}）",
             ) from error
 
-        if response.status_code in (401, 403):
+        if response.status_code == 401:
             raise ValueError("Cookie 已失效，请更新 BOHE_COOKIE")
+        if response.status_code == 403:
+            detail = payload.get("message") or payload.get("detail")
+            if detail:
+                raise ValueError(f"请求被服务器拒绝：{detail}")
+            raise ValueError("请求被服务器拒绝（HTTP 403），请检查请求来源或 Cookie")
         if response.status_code != 200:
             detail = payload.get("message", payload.get("detail", "请求失败"))
             raise ValueError(f"HTTP {response.status_code}：{detail}")
@@ -207,6 +207,67 @@ def mask_username(username: str) -> str:
     if len(username) == 2:
         return f"{username[0]}*"
     return f"{username[0]}***{username[-1]}"
+
+
+def extract_checkin_status_data(payload: dict[str, Any]) -> dict[str, Any]:
+    """兼容接口字段位于顶层或 data 对象中的两种响应结构。"""
+    nested_data = payload.get("data")
+    if not isinstance(nested_data, dict):
+        return payload
+
+    top_level_data = {
+        key: value for key, value in payload.items() if key != "data"
+    }
+    return {**nested_data, **top_level_data}
+
+
+def determine_should_submit_spin(status_data: dict[str, Any]) -> bool:
+    """仅依据明确的布尔状态决定是否调用转盘接口。"""
+    can_spin = status_data.get("can_spin")
+    if isinstance(can_spin, bool):
+        return can_spin
+
+    for field_name in (
+        "checked_in_today",
+        "already_checked_in",
+        "has_checked_in",
+    ):
+        status_value = status_data.get(field_name)
+        if isinstance(status_value, bool):
+            return not status_value
+
+    raise ValueError("签到状态响应缺少可识别字段，已停止调用签到接口")
+
+
+def extract_today_reward(status_data: dict[str, Any]) -> str:
+    reward_value = extract_first_value(
+        status_data,
+        ("today_quota", "today_reward"),
+    )
+    if reward_value is not None:
+        return str(reward_value)
+
+    today_record = status_data.get("today_record")
+    if isinstance(today_record, dict):
+        reward_value = extract_first_value(
+            today_record,
+            ("quota", "reward", "amount", "quota_amount"),
+        )
+        if reward_value is not None:
+            return str(reward_value)
+
+    return "-"
+
+
+def extract_first_value(
+    values: dict[str, Any],
+    field_names: tuple[str, ...],
+) -> Any | None:
+    for field_name in field_names:
+        field_value = values.get(field_name)
+        if field_value is not None and field_value != "":
+            return field_value
+    return None
 
 
 def describe_request_error(error: requests.RequestException) -> str:
