@@ -12,7 +12,7 @@ new Env('尚香书苑签到')
                          Cookie 优先级最高：整行不含 | 时视为纯 Cookie。
   OCR_KEY              账密登录或自动域名发现时必填。讯飞图像理解
                        APIKey（服务管控页面获取），所有需要 OCR 的任务共用。
-  SXSY_HOST            可选。手动指定站点域名（如 sxsy13.com），
+  SXSY_HOST            可选。手动指定站点域名（如 sxsy45.com），
                        设置后跳过发布页域名发现。
   SXSY_PRIVACY_MODE    日志和通知中是否对账号名脱敏，默认为 true。
   TG_NOTIFY_CONFIG     可选。统一 Telegram 配置：BotToken|ChatID|APIHost；
@@ -22,9 +22,10 @@ new Env('尚香书苑签到')
   TASK_TIMEOUT         单次请求超时秒数，默认为 20（所有任务共用）。
   TASK_ACCOUNT_DELAY   多账号之间的等待秒数，默认为 3（所有任务共用）。
 
-站点发布页 https://sxsy.org/ 把最新域名放在 site.jpg 图片里。
-脚本优先验证上次成功的域名缓存；缓存不可用时下载图片并使用
-讯飞 OCR 识别最新域名，再失败则使用内置默认域名。
+站点发布页 https://sxsy.org/ 把最新域名放在图片里（当前为 site1.jpg，
+历史上为 site.jpg，旧图仍在服务器上但内容已过期）。脚本优先验证上次
+成功的域名缓存；缓存不可用时解析发布页 HTML 找出当前可见引用的图片，
+用讯飞 OCR 逐张识别并验证域名可用性，再失败则使用内置默认域名。
 
 Cookie 持久化：账密登录成功后把最新 Cookie 存入青龙数据目录
 （默认 /ql/data/scripts_data/sxsy_cookies.json），之后运行优先用本地
@@ -66,8 +67,10 @@ from comm.task_runtime import (
 
 
 RELEASE_PAGE_URL = "https://sxsy.org/"
-DOMAIN_IMAGE_PATH = "site.jpg"
-DEFAULT_HOST = "sxsy13.com"
+# 发布页已改用 site1.jpg 引用最新域名；旧图 site.jpg 仍在服务器上但
+# 内容已过期。DOMAIN_IMAGE_PATH 仅作为 HTML 解析失败时的兜底。
+DOMAIN_IMAGE_PATH = "site1.jpg"
+DEFAULT_HOST = "sxsy45.com"
 
 # 本地数据固定放在青龙持久卷中；目录不存在时直接创建，不把运行数据
 # 混入可能被订阅删除或改名的脚本目录。
@@ -92,6 +95,13 @@ WELCOME_PATTERN = re.compile(r"欢迎您回来，(.*?)，")
 MONEY_PATTERN = re.compile(r"金钱:\s*</em>(\d+)")
 MATH_VERIFICATION_PATTERN = re.compile(
     r"签到验证\s*[：:]\s*(-?\d+)\s*([+\-*/×÷xX])\s*(-?\d+)\s*=\s*\?",
+)
+HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
+IMG_SRC_PATTERN = re.compile(
+    r"<img\b[^>]*?\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE,
+)
+HIDDEN_ATTRIBUTE_PATTERN = re.compile(
+    r"\bhidden\b|\bstyle=[\"'][^\"']*display\s*:\s*none", re.IGNORECASE,
 )
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
@@ -173,10 +183,35 @@ def parse_account_configurations(
     return configurations, configuration_errors
 
 
-def discover_host_via_ocr(
+def extract_visible_image_urls(page_html: str) -> list[str]:
+    """从发布页 HTML 提取可见 <img> 的绝对地址。
+
+    先剔除注释块，避免解析到 <!-- <img src="..."> --> 里的历史图片；
+    再跳过带 hidden 属性或 display:none 内联样式的隐藏图片，只留下
+    页面上实际可见的引用。返回相对路径转绝对地址后的 URL 列表。
+    """
+    html_without_comments = HTML_COMMENT_PATTERN.sub("", page_html)
+    visible_image_urls: list[str] = []
+    for image_tag_match in re.finditer(
+        r"<img\b[^>]*>", html_without_comments, re.IGNORECASE,
+    ):
+        image_tag = image_tag_match.group(0)
+        if HIDDEN_ATTRIBUTE_PATTERN.search(image_tag):
+            continue
+        source_match = IMG_SRC_PATTERN.search(image_tag)
+        if not source_match:
+            continue
+        absolute_url = urljoin(RELEASE_PAGE_URL, source_match.group(1))
+        if absolute_url not in visible_image_urls:
+            visible_image_urls.append(absolute_url)
+    return visible_image_urls
+
+
+def recognize_domain_from_image(
+    image_url: str,
     timeout_seconds: float,
 ) -> str | None:
-    image_url = urljoin(RELEASE_PAGE_URL, DOMAIN_IMAGE_PATH)
+    """下载单张图片并 OCR 识别出其中的域名。"""
     try:
         image_response = requests.get(
             image_url,
@@ -185,7 +220,10 @@ def discover_host_via_ocr(
         )
         image_response.raise_for_status()
     except requests.RequestException as error:
-        print(f"[域名发现] 下载域名图片失败：{describe_request_error(error)}")
+        print(
+            f"[域名发现] 下载图片 {image_url} 失败："
+            f"{describe_request_error(error)}",
+        )
         return None
 
     recognized_text = _ocr_recognize_text(
@@ -205,6 +243,61 @@ def discover_host_via_ocr(
         return None
 
     return host_match.group(0).lower()
+
+
+def discover_host_via_ocr(
+    timeout_seconds: float,
+) -> str | None:
+    """从发布页发现当前可见的域名图片，OCR 识别并验证域名可用性。
+
+    站点发布页历史上把最新域名放在 site.jpg，后改为 site1.jpg，旧图
+    仍保留在服务器上但内容已过期。因此不再写死单个图片路径，而是解析
+    发布页 HTML 找出当前可见引用的 <img>，逐张 OCR 并验证登录页可用，
+    避免识别到过期的旧域名。HTML 解析不到任何可见图片时，回退使用
+    DOMAIN_IMAGE_PATH 兜底。
+    """
+    try:
+        page_response = requests.get(
+            RELEASE_PAGE_URL,
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout_seconds,
+        )
+        page_response.raise_for_status()
+    except requests.RequestException as error:
+        print(f"[域名发现] 获取发布页失败：{describe_request_error(error)}")
+        return None
+
+    candidate_image_urls = extract_visible_image_urls(page_response.text)
+    if candidate_image_urls:
+        print(
+            f"[域名发现] 发布页可见图片：{', '.join(candidate_image_urls)}"
+        )
+    else:
+        fallback_url = urljoin(RELEASE_PAGE_URL, DOMAIN_IMAGE_PATH)
+        print(
+            "[域名发现] 发布页未解析到可见图片，"
+            f"回退使用兜底图片：{fallback_url}",
+        )
+        candidate_image_urls = [fallback_url]
+
+    for image_url in candidate_image_urls:
+        discovered_host = recognize_domain_from_image(
+            image_url,
+            timeout_seconds,
+        )
+        if not discovered_host:
+            continue
+
+        validated_host = validate_host(discovered_host, timeout_seconds)
+        if validated_host:
+            print(
+                f"[域名发现] 从图片 {image_url} 识别到可用域名："
+                f"{validated_host}",
+            )
+            return validated_host
+        print(f"[域名发现] 图片 {image_url} 识别域名不可用：{discovered_host}")
+
+    return None
 
 
 def read_cached_host() -> str | None:
@@ -285,12 +378,9 @@ def resolve_host(
 
     discovered_host = discover_host_via_ocr(timeout_seconds)
     if discovered_host:
-        validated_host = validate_host(discovered_host, timeout_seconds)
-        if validated_host:
-            write_cached_host(validated_host)
-            print(f"[域名发现] OCR 识别到最新域名：{validated_host}")
-            return validated_host, None
-        print(f"[域名发现] OCR 识别域名不可用：{discovered_host}")
+        write_cached_host(discovered_host)
+        print(f"[域名发现] OCR 识别到最新域名：{discovered_host}")
+        return discovered_host, None
 
     print(f"[域名发现] OCR 识别失败且无缓存，使用默认域名：{DEFAULT_HOST}")
     return DEFAULT_HOST, None
