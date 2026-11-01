@@ -788,20 +788,14 @@ class BaiduPanTaskClient:
             print(f"[任务] {message}")
             return summary
 
-        source_label = {
-            "taskscore": "旧任务列表",
-            "coins": "金币任务列表",
-        }.get(source, source)
         claimable_tasks = [
             task
             for task in tasks
             if to_int(task.get("task_status"), -1) == claimable_status
         ]
         summary.total = len(claimable_tasks)
-        print(
-            f"[任务] 来源 {source_label}，共 {len(tasks)} 个任务，"
-            f"可领取 {len(claimable_tasks)} 个",
-        )
+        if claimable_tasks:
+            print(f"[任务] 可领取 {len(claimable_tasks)} 个")
         if not claimable_tasks:
             return summary
 
@@ -906,7 +900,11 @@ class BaiduPanTaskClient:
         ask_id = question.get("ask_id")
         question_text = str(question.get("question") or "(空)").replace("\n", " ")
         print(f"[答题] 题目：{question_text}")
-        print(f"[答题] ask_id={ask_id} answer_status={answer_status}")
+        answer_status_text = {
+            1: "今日已答对",
+            2: "今日已答错",
+        }.get(answer_status, "今日待作答")
+        print(f"[答题] {answer_status_text}")
 
         if answer_status == 1:
             details = self._quiz_details(question)
