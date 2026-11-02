@@ -28,12 +28,9 @@ new Env('百度网盘任务系统签到')
   3. 对当前 90 天签到周期内的漏签日调用
      /coins/taskcenter/supptasklist 查询补签方式；只使用 SVIP 免费额度
      （supp_type=1）补最近一天，不消耗金币、不自动做补签任务，每日限 1 次；
-  4. 调用 /coins/taskcenter/tasklist 拉取日常与成长任务，领取
-     task_status=6 的任务奖励；金币接口不可用时回退旧版
-     /api/taskscore/tasklist（task_status=1）；
-  5. 调用 /act/v2/membergrowv2/getdailyquestion 获取判断题并提交答案；
+  4. 调用 /act/v2/membergrowv2/getdailyquestion 获取判断题并提交答案；
      答对后调用 /api/taskscore/tasksave 上报「每日答题」任务（task_type=169），
-     再领取解锁的答题任务奖励。
+     由 tasksave 完成该任务并发放成长值。
 
 请求需要复刻网页端的设备参数与 jt/token 签名。device 参数由 Cookie 中的
 BAIDUID 派生，保证同一账号每次运行使用同一设备标识。jt 签名会带上活动页
@@ -85,7 +82,6 @@ TASK_FROM = [
 API_TASK_LIST = "/api/taskscore/tasklist"
 API_COIN_TASK_LIST = "/coins/taskcenter/tasklist"
 API_TASK_SAVE = "/api/taskscore/tasksave"
-API_TASK_ANTI_SAVE = "/api/taskscore/antisave"
 API_LOGIN_STATUS = "/api/loginstatus"
 API_DAILY_QUESTION = "/act/v2/membergrowv2/getdailyquestion"
 API_ANSWER_QUESTION = "/act/v2/membergrowv2/answerquestion"
@@ -98,10 +94,6 @@ API_COIN_SUPP_SIGN = "/coins/taskcenter/suppsignin"
 
 COIN_TASK_FROM = [task_from for task_from in TASK_FROM if task_from != "task_sys_badge"]
 GROWTH_TASK_FROM = ["task_sys_task_growth"]
-
-EVENT_MAP = {
-    API_TASK_ANTI_SAVE: "task",
-}
 
 ERRNO_MEANING = {
     "-6": "未登录",
@@ -124,19 +116,6 @@ DEFAULT_USER_AGENT = (
     "Chrome/144.0.0.0 Safari/537.36"
 )
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
-DEFAULT_SPACE_UNIT = {1: "GB", 2: "MB"}
-
-
-@dataclass
-class ClaimSummary:
-    total: int = 0
-    claimed: int = 0
-    already: int = 0
-    failed: int = 0
-    growth: int = 0
-    messages: list[str] = field(default_factory=list)
-    endpoint_ok: bool = True
-    fallback: bool = False
 
 
 @dataclass
@@ -193,7 +172,6 @@ class AccountResult:
     account_label: str
     success: bool
     status: str
-    claim_message: str
     quiz_message: str
     signin_message: str = ""
     supplement_message: str = ""
@@ -201,7 +179,6 @@ class AccountResult:
     signin_growth: int = 0
     supplement_growth: int = 0
     reward_growth: int = 0
-    task_growth: int = 0
     quiz_growth: int = 0
     growth_total: int = 0
     warning: bool = False
@@ -342,29 +319,6 @@ def pick_task_list(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
     return None
 
 
-def format_reward(payload: dict[str, Any]) -> str:
-    result = payload.get("result")
-    if not isinstance(result, dict):
-        result = payload.get("task_result")
-    if not isinstance(result, dict):
-        return ""
-    parts: list[str] = []
-    add_score = to_int(result.get("addScore"))
-    add_growth = to_int(result.get("addGrowScore"))
-    add_space = to_int(result.get("addSpace"))
-    if add_score > 0:
-        parts.append(f"+{add_score} 积分")
-    if add_growth > 0:
-        parts.append(f"+{add_growth} 成长值")
-    if add_space > 0:
-        space_unit = DEFAULT_SPACE_UNIT.get(
-            to_int(result.get("space_unit"), 1),
-            "GB",
-        )
-        parts.append(f"+{add_space}{space_unit} 空间")
-    return "、".join(parts)
-
-
 def format_prize_list(prizes: Any) -> str:
     if not isinstance(prizes, list):
         return ""
@@ -391,15 +345,6 @@ def sum_growth_prizes(prizes: Any) -> int:
         if to_int(prize.get("type")) == 3:
             total += max(to_int(prize.get("unit")), 0)
     return total
-
-
-def extract_growth(payload: dict[str, Any]) -> int:
-    result = payload.get("result")
-    if not isinstance(result, dict):
-        result = payload.get("task_result")
-    if not isinstance(result, dict):
-        return 0
-    return max(to_int(result.get("addGrowScore")), 0)
 
 
 def parse_answer_value(value: Any) -> int | None:
@@ -473,27 +418,11 @@ class BaiduPanTaskClient:
             print(f"[账号] uk={account_label}")
 
             signin_result = self._sign_in()
-            claim_summary = self._claim_tasks("签到后领取")
             quiz_result = self._answer_daily_question()
 
-            if quiz_result.correct:
-                time.sleep(1.2)
-                second_summary = self._claim_tasks("答题后领取")
-                self._merge_claim_summary(claim_summary, second_summary)
-
-            endpoints_ok = (
-                signin_result.endpoint_ok
-                and claim_summary.endpoint_ok
-                and quiz_result.endpoint_ok
-            )
-            claims_effective = claim_summary.claimed + claim_summary.already
-            claims_ok = claim_summary.failed == 0 or claims_effective > 0
-            success = endpoints_ok and claims_ok and signin_result.signed
-            warning = success and (
-                not quiz_result.correct
-                or claim_summary.failed > 0
-                or claim_summary.fallback
-            )
+            endpoints_ok = signin_result.endpoint_ok and quiz_result.endpoint_ok
+            success = endpoints_ok and signin_result.signed
+            warning = success and not quiz_result.correct
             if not success:
                 status = "失败"
             elif warning:
@@ -521,7 +450,6 @@ class BaiduPanTaskClient:
                 signin_result.daily_growth
                 + signin_result.supplement_growth
                 + signin_result.reward_growth
-                + claim_summary.growth
                 + quiz_result.growth
             )
             details = {"今日成长值": f"+{growth_total}"}
@@ -530,7 +458,6 @@ class BaiduPanTaskClient:
                 account_label=account_label,
                 success=success,
                 status=status,
-                claim_message=self._format_claim_message(claim_summary),
                 quiz_message=quiz_message,
                 signin_message=signin_message,
                 supplement_message=signin_result.supplement_text,
@@ -538,7 +465,6 @@ class BaiduPanTaskClient:
                 signin_growth=signin_result.daily_growth,
                 supplement_growth=signin_result.supplement_growth,
                 reward_growth=signin_result.reward_growth,
-                task_growth=claim_summary.growth,
                 quiz_growth=quiz_result.growth,
                 growth_total=growth_total,
                 warning=warning,
@@ -567,34 +493,9 @@ class BaiduPanTaskClient:
             account_label="未知账号",
             success=False,
             status=status,
-            claim_message=message,
             quiz_message="未执行",
-            signin_message="未执行",
+            signin_message=message,
         )
-
-    @staticmethod
-    def _format_claim_message(summary: ClaimSummary) -> str:
-        if not summary.endpoint_ok:
-            return "获取失败"
-        if summary.total == 0:
-            return "无"
-        parts = [f"领取 {summary.claimed} 个"]
-        if summary.already:
-            parts.append(f"已领 {summary.already} 个")
-        if summary.failed:
-            parts.append(f"失败 {summary.failed} 个")
-        return " · ".join(parts)
-
-    @staticmethod
-    def _merge_claim_summary(target: ClaimSummary, source: ClaimSummary) -> None:
-        target.total += source.total
-        target.claimed += source.claimed
-        target.already += source.already
-        target.failed += source.failed
-        target.growth += source.growth
-        target.messages.extend(source.messages)
-        target.endpoint_ok = target.endpoint_ok and source.endpoint_ok
-        target.fallback = target.fallback or source.fallback
 
     def _ensure_uk(self) -> str:
         if self.uk:
@@ -631,10 +532,7 @@ class BaiduPanTaskClient:
             query.setdefault("uk", self.uk)
         query.setdefault("aid", AID)
 
-        event = EVENT_MAP.get(path)
-        if event:
-            query.setdefault("ev", event)
-        query.setdefault("jt", make_jt(self.device, self.activity_url, event or "task"))
+        query.setdefault("jt", make_jt(self.device, self.activity_url, "task"))
         query.setdefault("rand", random_numeric_string())
         query.setdefault("rand2", random_numeric_string())
         query.setdefault("time", str(int(time.time() * 1000)))
@@ -649,12 +547,9 @@ class BaiduPanTaskClient:
         if path.startswith("/coins/"):
             query.setdefault("cuid", self.device.cuid)
             query.setdefault("idfv", self.device.idfv)
-        # 实测 antisave 携带 hjs=1 会直接返回 8001，需省略；
-        # tasksave / tasklist 等接口保持 hjs=1。
-        if path != API_TASK_ANTI_SAVE:
-            query.setdefault("hjs", "1")
+        query.setdefault("hjs", "1")
 
-        if path in (API_TASK_SAVE, API_TASK_ANTI_SAVE):
+        if path == API_TASK_SAVE:
             task_ids = str(query.get("task_ids") or query.get("task_id") or "")
             if task_ids and self.uk:
                 query["token"] = md5_hex(
@@ -719,53 +614,6 @@ class BaiduPanTaskClient:
             print(f"[任务] {purpose}结构异常")
             return None, False
         return tasks, True
-
-    def _fetch_coin_tasks(self) -> tuple[list[dict[str, Any]], bool]:
-        all_tasks: list[dict[str, Any]] = []
-        any_ok = False
-        seen: set[tuple[str, str]] = set()
-        for task_from, purpose in (
-            (COIN_TASK_FROM, "金币任务列表"),
-            (GROWTH_TASK_FROM, "成长任务列表"),
-        ):
-            tasks, ok = self._fetch_tasks_from(
-                API_COIN_TASK_LIST,
-                task_from,
-                purpose,
-            )
-            if not ok:
-                continue
-            any_ok = True
-            for task in tasks:
-                key = (
-                    str(task.get("task_id_str") or task.get("task_id") or ""),
-                    str(task.get("task_from") or ""),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                all_tasks.append(task)
-        return all_tasks, any_ok
-
-    def _fetch_tasks(
-        self,
-    ) -> tuple[list[dict[str, Any]], int, str, bool]:
-        coin_tasks, coin_ok = self._fetch_coin_tasks()
-        if coin_ok and coin_tasks:
-            return coin_tasks, 6, "coins", True
-        if not coin_ok:
-            print("[任务] 金币任务列表不可用，尝试旧任务列表")
-
-        tasks, tasks_ok = self._fetch_tasks_from(
-            API_TASK_LIST,
-            TASK_FROM,
-            "旧任务列表",
-        )
-        if tasks_ok:
-            return tasks, 1, "taskscore", True
-        if coin_ok:
-            return coin_tasks, 6, "coins", True
-        return [], 1, "none", False
 
     def _find_sign_task(self) -> dict[str, Any] | None:
         for path, task_from, purpose in (
@@ -1158,89 +1006,6 @@ class BaiduPanTaskClient:
             details=details,
         )
 
-    def _claim_tasks(self, phase: str) -> ClaimSummary:
-        summary = ClaimSummary()
-        print(f"[任务] 开始{phase}")
-        tasks, claimable_status, source, endpoint_ok = self._fetch_tasks()
-        summary.endpoint_ok = endpoint_ok
-        summary.fallback = source != "coins"
-        if not endpoint_ok:
-            message = "任务列表获取失败"
-            summary.messages.append(message)
-            print(f"[任务] {message}")
-            return summary
-
-        claimable_tasks = [
-            task
-            for task in tasks
-            if to_int(task.get("task_status"), -1) == claimable_status
-        ]
-        summary.total = len(claimable_tasks)
-        if claimable_tasks:
-            print(f"[任务] 可领取 {len(claimable_tasks)} 个")
-        if not claimable_tasks:
-            return summary
-
-        for task in claimable_tasks:
-            task_id = str(task.get("task_id_str") or task.get("task_id") or "")
-            task_name = str(task.get("task_name") or task_id or "未知任务")
-            task_from = str(task.get("task_from") or "")
-            if not task_id:
-                summary.failed += 1
-                summary.messages.append(f"{task_name}：缺少 task_id")
-                continue
-
-            # 旧任务列表用 tasksave 领取；金币任务列表与网页端一致，
-            # 走 antisave + action=receive_award。
-            claim_path = (
-                API_TASK_ANTI_SAVE if source == "coins" else API_TASK_SAVE
-            )
-            claim_params: dict[str, Any] = {
-                "task_id": task_id,
-                "task_from": task_from,
-                "uk": self.uk,
-            }
-            if claim_path == API_TASK_ANTI_SAVE:
-                claim_params["action"] = "receive_award"
-
-            try:
-                claim_payload = self._api(
-                    claim_path,
-                    claim_params,
-                    f"领取 {task_name}",
-                )
-            except (requests.RequestException, ValueError) as error:
-                summary.failed += 1
-                summary.messages.append(f"{task_name}：{error}")
-                print(f"[任务] {task_name} 领取异常：{error}")
-                time.sleep(random.uniform(0.6, 1.2))
-                continue
-
-            errno = to_int(claim_payload.get("errno"))
-            if errno == 0:
-                reward = format_reward(claim_payload)
-                summary.claimed += 1
-                if to_int(task.get("task_type")) != 169:
-                    summary.growth += extract_growth(claim_payload)
-                summary.messages.append(f"{task_name}：领取成功{(' ' + reward) if reward else ''}")
-                print(f"  ✅ {task_name} 领取成功{(' ' + reward) if reward else ''}")
-            elif errno == 40003:
-                summary.already += 1
-                summary.messages.append(f"{task_name}：已领取")
-                print(f"  · {task_name} 已领取")
-            else:
-                summary.failed += 1
-                message = f"{task_name}：{errno_text(claim_payload) or '领取失败'}"
-                summary.messages.append(message)
-                print(f"  ❌ {message}")
-            time.sleep(random.uniform(0.6, 1.2))
-
-        print(
-            f"[任务] {phase}完成：成功 {summary.claimed}，已领 {summary.already}，"
-            f"失败 {summary.failed}",
-        )
-        return summary
-
     def _find_growth_task(self, task_type: int) -> dict[str, Any] | None:
         tasks, ok = self._fetch_tasks_from(
             API_COIN_TASK_LIST,
@@ -1577,8 +1342,6 @@ def build_account_notification(result: AccountResult) -> tuple[str, str, str]:
         entries.append(("补签", result.supplement_message, result.supplement_growth))
     if result.reward_message:
         entries.append(("签到奖励", result.reward_message, result.reward_growth))
-    if result.claim_message and result.claim_message != "无":
-        entries.append(("任务", result.claim_message, result.task_growth))
     if result.quiz_message:
         entries.append(("答题", result.quiz_message, result.quiz_growth))
 
