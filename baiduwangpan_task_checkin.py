@@ -113,6 +113,7 @@ ERRNO_MEANING = {
     "8011": "作弊频控",
     "8024": "作弊频控",
     "9312": "设备重复",
+    "35025": "该日已签到",
     "35026": "今日补签次数已用完",
     "36353": "未达到领取条件",
 }
@@ -809,7 +810,10 @@ class BaiduPanTaskClient:
                 result.month_left = month_left
                 result.month_total = month_count
                 result.day_limit = day_count
-                quota_text = f"剩余 {month_left}/{month_count} 次，每日限 {day_count} 次"
+                quota_text = (
+                    f"补签前剩余 {month_left}/{month_count} 次，"
+                    f"每日限 {day_count} 次"
+                )
                 result.details["本月补签"] = quota_text
                 print(f"  · 本月补签{quota_text}")
 
@@ -825,8 +829,7 @@ class BaiduPanTaskClient:
                 return result
 
             if month_left <= 0:
-                result.message = "本月补签额度已用完"
-                return result
+                print("  · 接口显示本月额度已用完，仍交由服务端判断")
 
             try:
                 sign_payload = self._api(
@@ -848,7 +851,7 @@ class BaiduPanTaskClient:
                 result.date_text = date_text
                 result.message = f"已补签 {date_text}（连续 {new_days} 天）"
                 result.details["补签"] = f"{date_text}（连续 {new_days} 天）"
-                print(f"  ✅ 补签 {date_text} 成功（连续 {new_days} 天）")
+                print(f"  ✅ 补签 {date_text} 成功")
                 return result
 
             if errno == 35026:
@@ -1017,6 +1020,7 @@ class BaiduPanTaskClient:
             sign_data = self._fetch_sign_list(sign_task) if sign_task else sign_data
             if sign_data:
                 days = to_int(sign_data.get("signin_days")) or days
+            print(f"  · 补签后连续 {days} 天")
             if supplement_result.date_text:
                 supplement_result.message = (
                     f"已补签 {supplement_result.date_text}（连续 {days} 天）"
@@ -1025,10 +1029,10 @@ class BaiduPanTaskClient:
                     f"{supplement_result.date_text}（连续 {days} 天）"
                 )
             if supplement_result.month_total > 0:
-                remaining = max(supplement_result.month_left - 1, 0)
                 supplement_result.details["本月补签"] = (
-                    f"剩余 {remaining}/{supplement_result.month_total} 次，"
-                    f"每日限 {supplement_result.day_limit} 次"
+                    f"补签前剩余 {supplement_result.month_left}/"
+                    f"{supplement_result.month_total} 次，"
+                    f"每日限 {supplement_result.day_limit} 次（本次已用 1 次）"
                 )
 
         reward_result = self._claim_sign_rewards(sign_data)
