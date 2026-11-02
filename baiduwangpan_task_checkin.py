@@ -133,6 +133,7 @@ class ClaimSummary:
     claimed: int = 0
     already: int = 0
     failed: int = 0
+    growth: int = 0
     messages: list[str] = field(default_factory=list)
     endpoint_ok: bool = True
     fallback: bool = False
@@ -145,12 +146,20 @@ class SignInResult:
     signed: bool = False
     already: bool = False
     endpoint_ok: bool = True
+    days: int = 0
+    daily_growth: int = 0
+    supplement_growth: int = 0
+    reward_growth: int = 0
+    supplement_text: str = ""
+    reward_text: str = ""
     details: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class SignRewardResult:
     claimed: int = 0
+    growth: int = 0
+    days: list[int] = field(default_factory=list)
     message: str = ""
     details: dict[str, str] = field(default_factory=dict)
 
@@ -160,6 +169,7 @@ class SupplementResult:
     supplemented: bool = False
     message: str = ""
     date_text: str = ""
+    growth: int = 0
     month_left: int = 0
     month_total: int = 0
     day_limit: int = 0
@@ -172,6 +182,7 @@ class QuizResult:
     message: str
     correct: bool = False
     should_claim: bool = False
+    growth: int = 0
     endpoint_ok: bool = True
     details: dict[str, str] = field(default_factory=dict)
 
@@ -185,6 +196,14 @@ class AccountResult:
     claim_message: str
     quiz_message: str
     signin_message: str = ""
+    supplement_message: str = ""
+    reward_message: str = ""
+    signin_growth: int = 0
+    supplement_growth: int = 0
+    reward_growth: int = 0
+    task_growth: int = 0
+    quiz_growth: int = 0
+    growth_total: int = 0
     warning: bool = False
     details: dict[str, str] = field(default_factory=dict)
 
@@ -362,6 +381,27 @@ def format_prize_list(prizes: Any) -> str:
     return "、".join(parts)
 
 
+def sum_growth_prizes(prizes: Any) -> int:
+    if not isinstance(prizes, list):
+        return 0
+    total = 0
+    for prize in prizes:
+        if not isinstance(prize, dict):
+            continue
+        if to_int(prize.get("type")) == 3:
+            total += max(to_int(prize.get("unit")), 0)
+    return total
+
+
+def extract_growth(payload: dict[str, Any]) -> int:
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        result = payload.get("task_result")
+    if not isinstance(result, dict):
+        return 0
+    return max(to_int(result.get("addGrowScore")), 0)
+
+
 def parse_answer_value(value: Any) -> int | None:
     if isinstance(value, bool):
         return int(value)
@@ -460,23 +500,47 @@ class BaiduPanTaskClient:
                 status = "完成（有提示）"
             else:
                 status = "完成"
-            details = {
-                "签到状态": signin_result.status,
-                "可领取任务": str(claim_summary.total),
-                "领取成功": str(claim_summary.claimed),
-                "已领取过": str(claim_summary.already),
-                "领取失败": str(claim_summary.failed),
-            }
-            details.update(signin_result.details)
-            details.update(quiz_result.details)
+            quiz_message = {
+                "回答正确": "答对",
+                "今日已答对": "已答对",
+                "回答错误": "答错",
+                "今日已答错": "已答错",
+                "答题未生效": "未生效",
+                "提交失败": "提交失败",
+                "获取失败": "获取失败",
+            }.get(quiz_result.status, "未完成")
+            if signin_result.signed:
+                signin_message = (
+                    f"{'已签' if signin_result.already else '成功'}"
+                    + (f" · 连续 {signin_result.days} 天" if signin_result.days else "")
+                )
+            else:
+                signin_message = signin_result.message
+
+            growth_total = (
+                signin_result.daily_growth
+                + signin_result.supplement_growth
+                + signin_result.reward_growth
+                + claim_summary.growth
+                + quiz_result.growth
+            )
+            details = {"今日成长值": f"+{growth_total}"}
             return AccountResult(
                 account_number=self.account_number,
                 account_label=account_label,
                 success=success,
                 status=status,
                 claim_message=self._format_claim_message(claim_summary),
-                quiz_message=quiz_result.message,
-                signin_message=signin_result.message,
+                quiz_message=quiz_message,
+                signin_message=signin_message,
+                supplement_message=signin_result.supplement_text,
+                reward_message=signin_result.reward_text,
+                signin_growth=signin_result.daily_growth,
+                supplement_growth=signin_result.supplement_growth,
+                reward_growth=signin_result.reward_growth,
+                task_growth=claim_summary.growth,
+                quiz_growth=quiz_result.growth,
+                growth_total=growth_total,
                 warning=warning,
                 details=details,
             )
@@ -511,13 +575,15 @@ class BaiduPanTaskClient:
     @staticmethod
     def _format_claim_message(summary: ClaimSummary) -> str:
         if not summary.endpoint_ok:
-            return "任务列表获取失败"
+            return "获取失败"
         if summary.total == 0:
-            return "暂无待领取任务"
-        return (
-            f"待领取 {summary.total} 个，成功 {summary.claimed} 个，"
-            f"已领 {summary.already} 个，失败 {summary.failed} 个"
-        )
+            return "无"
+        parts = [f"领取 {summary.claimed} 个"]
+        if summary.already:
+            parts.append(f"已领 {summary.already} 个")
+        if summary.failed:
+            parts.append(f"失败 {summary.failed} 个")
+        return " · ".join(parts)
 
     @staticmethod
     def _merge_claim_summary(target: ClaimSummary, source: ClaimSummary) -> None:
@@ -525,6 +591,7 @@ class BaiduPanTaskClient:
         target.claimed += source.claimed
         target.already += source.already
         target.failed += source.failed
+        target.growth += source.growth
         target.messages.extend(source.messages)
         target.endpoint_ok = target.endpoint_ok and source.endpoint_ok
         target.fallback = target.fallback or source.fallback
@@ -726,6 +793,17 @@ class BaiduPanTaskClient:
             "signToday": "1",
         }
 
+    @staticmethod
+    def _sign_day_growth(sign_data: dict[str, Any] | None, day_number: int) -> int:
+        if not sign_data:
+            return 0
+        for item in sign_data.get("signin_list") or []:
+            if not isinstance(item, dict):
+                continue
+            if to_int(item.get("day")) == day_number:
+                return sum_growth_prizes(item.get("prize"))
+        return 0
+
     def _fetch_sign_list(self, sign_task: dict[str, Any]) -> dict[str, Any] | None:
         try:
             payload = self._api(
@@ -849,6 +927,7 @@ class BaiduPanTaskClient:
                 new_days = new_days or to_int(sign_data.get("signin_days"))
                 result.supplemented = True
                 result.date_text = date_text
+                result.growth = self._sign_day_growth(sign_data, number)
                 result.message = f"已补签 {date_text}（连续 {new_days} 天）"
                 result.details["补签"] = f"{date_text}（连续 {new_days} 天）"
                 print(f"  ✅ 补签 {date_text} 成功")
@@ -902,6 +981,8 @@ class BaiduPanTaskClient:
             if errno == 0:
                 reward_text = format_prize_list(item.get("prize"))
                 result.claimed += 1
+                result.growth += sum_growth_prizes(item.get("prize"))
+                result.days.append(day)
                 messages.append(f"第 {day} 天{(' ' + reward_text) if reward_text else ''}")
                 print(
                     f"  ✅ 连续签到第 {day} 天奖励领取成功"
@@ -1037,6 +1118,13 @@ class BaiduPanTaskClient:
 
         reward_result = self._claim_sign_rewards(sign_data)
 
+        daily_growth = 0
+        if sign_data:
+            daily_growth = self._sign_day_growth(
+                sign_data,
+                to_int(sign_data.get("day")),
+            )
+
         details: dict[str, str] = {"连续签到": f"{days} 天"}
         details.update(supplement_result.details)
         if supplement_result.message and not supplement_result.supplemented:
@@ -1053,11 +1141,20 @@ class BaiduPanTaskClient:
         if reward_result.claimed:
             message += f"，领取连续签到奖励 {reward_result.message}"
 
+        reward_text = "、".join(f"{day} 天" for day in reward_result.days)
         return SignInResult(
             status="今日已签到" if already_signed else "签到成功",
             message=message,
             signed=True,
             already=already_signed,
+            days=days,
+            daily_growth=daily_growth,
+            supplement_growth=supplement_result.growth,
+            reward_growth=reward_result.growth,
+            supplement_text=(
+                supplement_result.date_text if supplement_result.supplemented else ""
+            ),
+            reward_text=reward_text,
             details=details,
         )
 
@@ -1123,6 +1220,8 @@ class BaiduPanTaskClient:
             if errno == 0:
                 reward = format_reward(claim_payload)
                 summary.claimed += 1
+                if to_int(task.get("task_type")) != 169:
+                    summary.growth += extract_growth(claim_payload)
                 summary.messages.append(f"{task_name}：领取成功{(' ' + reward) if reward else ''}")
                 print(f"  ✅ {task_name} 领取成功{(' ' + reward) if reward else ''}")
             elif errno == 40003:
@@ -1262,6 +1361,7 @@ class BaiduPanTaskClient:
                 message=message,
                 correct=True,
                 should_claim=should_claim,
+                growth=to_int(question.get("score")),
                 details=details,
             )
         if answer_status == 2:
@@ -1327,35 +1427,22 @@ class BaiduPanTaskClient:
                             endpoint_ok=False,
                             details=details,
                         )
-                    details["答题复核"] = "已记录"
                 else:
                     print(f"[答题] 复核失败（{errno_text(verify_payload)}）")
             except (requests.RequestException, ValueError) as error:
                 print(f"[答题] 复核异常：{error}")
 
             score = result.get("score", question.get("task_score"))
-            points = result.get("points")
-            reward_parts: list[str] = []
-            if score not in (None, ""):
-                details["答题得分"] = str(score)
-                reward_parts.append(f"得分 {score}")
-            if points not in (None, ""):
-                details["答题积分"] = str(points)
-                reward_parts.append(f"积分 {points}")
-            reward_text = "，".join(reward_parts)
-            _task_handled, task_message, should_claim = self._report_quiz_task()
-            if task_message:
-                details["答题任务"] = task_message
-            print(f"  ✅ 回答正确{('，' + reward_text) if reward_text else ''}")
+            growth = to_int(score)
+            details["成长值"] = str(growth)
+            _task_handled, _task_message, should_claim = self._report_quiz_task()
+            print(f"  ✅ 回答正确，成长值 +{growth}")
             return QuizResult(
                 status="回答正确",
-                message=(
-                    f"回答正确（{answer_source}）"
-                    + (f"，{reward_text}" if reward_text else "")
-                    + (f"，{task_message}" if task_message else "")
-                ),
+                message="答对",
                 correct=True,
                 should_claim=should_claim,
+                growth=to_int(score),
                 details=details,
             )
 
@@ -1371,9 +1458,7 @@ class BaiduPanTaskClient:
     def _quiz_details(question: dict[str, Any]) -> dict[str, str]:
         details: dict[str, str] = {}
         if question.get("score") not in (None, ""):
-            details["当前得分"] = str(question.get("score"))
-        if question.get("points") not in (None, ""):
-            details["累计积分"] = str(question.get("points"))
+            details["成长值"] = str(question.get("score"))
         return details
 
 
@@ -1485,28 +1570,36 @@ def build_account_notification(result: AccountResult) -> tuple[str, str, str]:
     title = f"百度网盘任务系统 账号 {result.account_number} {result.status}"
     execution_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    entries: list[tuple[str, str, int]] = []
+    if result.signin_message:
+        entries.append(("签到", result.signin_message, result.signin_growth))
+    if result.supplement_message:
+        entries.append(("补签", result.supplement_message, result.supplement_growth))
+    if result.reward_message:
+        entries.append(("签到奖励", result.reward_message, result.reward_growth))
+    if result.claim_message and result.claim_message != "无":
+        entries.append(("任务", result.claim_message, result.task_growth))
+    if result.quiz_message:
+        entries.append(("答题", result.quiz_message, result.quiz_growth))
+
     html_lines = [
         "<b>百度网盘任务系统</b>",
         "",
         f"{status_icon} <b>账号 {result.account_number} · "
         f"{escape_html_text(result.account_label)}</b>",
-        f"• 状态：{escape_html_text(result.status)}",
-        f"• 签到：{escape_html_text(result.signin_message)}",
-        f"• 任务：{escape_html_text(result.claim_message)}",
-        f"• 答题：{escape_html_text(result.quiz_message)}",
     ]
     plain_lines = [
         "百度网盘任务系统",
         "",
         f"{status_icon} 账号 {result.account_number} · {result.account_label}",
-        f"• 状态：{result.status}",
-        f"• 签到：{result.signin_message}",
-        f"• 任务：{result.claim_message}",
-        f"• 答题：{result.quiz_message}",
     ]
-    for detail_key, detail_value in result.details.items():
-        html_lines.append(f"• {escape_html_text(detail_key)}：{html_code(detail_value)}")
-        plain_lines.append(f"• {detail_key}：{detail_value}")
+    for label, text, growth in entries:
+        suffix = f" · +{growth} 成长值" if growth > 0 else ""
+        html_lines.append(f"• {label}：{escape_html_text(text)}{suffix}")
+        plain_lines.append(f"• {label}：{text}{suffix}")
+
+    html_lines.append(f"• 今日成长值：{html_code(f'+{result.growth_total}')}")
+    plain_lines.append(f"• 今日成长值：+{result.growth_total}")
     html_lines.append(f"• 时间：{html_code(execution_time)}")
     plain_lines.append(f"• 时间：{execution_time}")
 
