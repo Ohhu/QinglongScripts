@@ -23,11 +23,17 @@ new Env('百度网盘任务系统签到')
   1. 调用 /coins/taskcenter/home 检查今日签到状态，未签到时使用
      /coins/taskcenter/signin 提交签到；签到请求需要「今日签到领奖」任务的
      task_id/task_from，并携带移动端设备参数 cuid/devuid/idfv；
-  2. 调用 /coins/taskcenter/tasklist 拉取日常与成长任务，领取
+  2. 读取 /coins/taskcenter/signinlist 的连续签到奖励，领取
+     received=1 的 7/15/30/60/90 天奖励（/coins/taskcenter/signinaward）；
+  3. 对当前 90 天签到周期内的漏签日调用
+     /coins/taskcenter/supptasklist 查询补签方式；只使用 SVIP 免费额度
+     （supp_type=1）补最近一天，不消耗金币、不自动做补签任务，每日限 1 次；
+  4. 调用 /coins/taskcenter/tasklist 拉取日常与成长任务，领取
      task_status=6 的任务奖励；金币接口不可用时回退旧版
      /api/taskscore/tasklist（task_status=1）；
-  3. 调用 /act/v2/membergrowv2/getdailyquestion 获取判断题并提交答案，
-     答对后再次拉取任务列表，把刚解锁的答题任务奖励领掉。
+  5. 调用 /act/v2/membergrowv2/getdailyquestion 获取判断题并提交答案；
+     答对后调用 /api/taskscore/tasksave 上报「每日答题」任务（task_type=169），
+     再领取解锁的答题任务奖励。
 
 请求需要复刻网页端的设备参数与 jt/token 签名。device 参数由 Cookie 中的
 BAIDUID 派生，保证同一账号每次运行使用同一设备标识。jt 签名会带上活动页
@@ -48,7 +54,7 @@ import random
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import requests
@@ -86,6 +92,9 @@ API_ANSWER_QUESTION = "/act/v2/membergrowv2/answerquestion"
 API_COIN_HOME = "/coins/taskcenter/home"
 API_COIN_SIGN = "/coins/taskcenter/signin"
 API_COIN_SIGN_LIST = "/coins/taskcenter/signinlist"
+API_COIN_SIGN_AWARD = "/coins/taskcenter/signinaward"
+API_COIN_SUPP_TASK = "/coins/taskcenter/supptasklist"
+API_COIN_SUPP_SIGN = "/coins/taskcenter/suppsignin"
 
 COIN_TASK_FROM = [task_from for task_from in TASK_FROM if task_from != "task_sys_badge"]
 GROWTH_TASK_FROM = ["task_sys_task_growth"]
@@ -104,6 +113,8 @@ ERRNO_MEANING = {
     "8011": "作弊频控",
     "8024": "作弊频控",
     "9312": "设备重复",
+    "35026": "今日补签次数已用完",
+    "36353": "未达到领取条件",
 }
 
 DEFAULT_USER_AGENT = (
@@ -133,6 +144,24 @@ class SignInResult:
     signed: bool = False
     already: bool = False
     endpoint_ok: bool = True
+    details: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class SignRewardResult:
+    claimed: int = 0
+    message: str = ""
+    details: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class SupplementResult:
+    supplemented: bool = False
+    message: str = ""
+    date_text: str = ""
+    month_left: int = 0
+    month_total: int = 0
+    day_limit: int = 0
     details: dict[str, str] = field(default_factory=dict)
 
 
@@ -316,6 +345,22 @@ def format_reward(payload: dict[str, Any]) -> str:
     return "、".join(parts)
 
 
+def format_prize_list(prizes: Any) -> str:
+    if not isinstance(prizes, list):
+        return ""
+    prize_names = {10: "积分", 3: "成长值"}
+    parts: list[str] = []
+    for prize in prizes:
+        if not isinstance(prize, dict):
+            continue
+        unit = to_int(prize.get("unit"))
+        if unit <= 0:
+            continue
+        prize_name = prize_names.get(to_int(prize.get("type")), "奖励")
+        parts.append(f"+{unit} {prize_name}")
+    return "、".join(parts)
+
+
 def parse_answer_value(value: Any) -> int | None:
     if isinstance(value, bool):
         return int(value)
@@ -390,7 +435,7 @@ class BaiduPanTaskClient:
             claim_summary = self._claim_tasks("签到后领取")
             quiz_result = self._answer_daily_question()
 
-            if quiz_result.correct and quiz_result.should_claim:
+            if quiz_result.correct:
                 time.sleep(1.2)
                 second_summary = self._claim_tasks("答题后领取")
                 self._merge_claim_summary(claim_summary, second_summary)
@@ -669,9 +714,212 @@ class BaiduPanTaskClient:
                     return task
         return None
 
+    @staticmethod
+    def _build_sign_params(sign_task: dict[str, Any]) -> dict[str, Any]:
+        task_id = str(sign_task.get("task_id_str") or sign_task.get("task_id") or "")
+        return {
+            "is_growth": "0",
+            "task_id": task_id,
+            "task_id_str": task_id,
+            "task_from": str(sign_task.get("task_from") or ""),
+            "signToday": "1",
+        }
+
+    def _fetch_sign_list(self, sign_task: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            payload = self._api(
+                API_COIN_SIGN_LIST,
+                self._build_sign_params(sign_task),
+                "签到日历",
+            )
+        except (requests.RequestException, ValueError) as error:
+            print(f"[签到] 日历获取失败：{error}")
+            return None
+        if to_int(payload.get("errno")) != 0:
+            print(f"[签到] 日历获取失败（{errno_text(payload)}）")
+            return None
+        data = payload.get("data")
+        return data if isinstance(data, dict) else None
+
+    def _supplement_sign(self, sign_data: dict[str, Any] | None) -> SupplementResult:
+        result = SupplementResult()
+        if not sign_data:
+            return result
+
+        signin_list = sign_data.get("signin_list")
+        current_day = to_int(sign_data.get("day"))
+        current_timestamp = to_int(sign_data.get("date"))
+        if (
+            not isinstance(signin_list, list)
+            or current_day <= 0
+            or current_timestamp <= 0
+        ):
+            return result
+
+        current_date = datetime.fromtimestamp(current_timestamp)
+        unsigned_days: list[tuple[int, datetime]] = []
+        for item in signin_list:
+            if not isinstance(item, dict):
+                continue
+            number = to_int(item.get("day"))
+            if number <= 0 or number >= current_day:
+                continue
+            if to_int(item.get("signed")) != 0:
+                continue
+            date = current_date - timedelta(days=current_day - number)
+            unsigned_days.append((number, date))
+        if not unsigned_days:
+            return result
+
+        unsigned_days.sort(key=lambda pair: pair[0], reverse=True)
+        latest_day, latest_date = unsigned_days[0]
+        print(
+            f"[补签] 当前周期漏签 {len(unsigned_days)} 天，"
+            f"最近 {latest_date.strftime('%m.%d')}",
+        )
+
+        quota_logged = False
+        for number, date in unsigned_days:
+            date_text = date.strftime("%m.%d")
+            try:
+                payload = self._api(
+                    API_COIN_SUPP_TASK,
+                    {"day": number},
+                    f"补签信息 {date_text}",
+                )
+            except (requests.RequestException, ValueError) as error:
+                print(f"[补签] {date_text} 信息获取失败：{error}")
+                continue
+
+            if to_int(payload.get("errno")) != 0:
+                print(f"[补签] {date_text} 信息获取失败（{errno_text(payload)}）")
+                continue
+
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            supp_type = to_int(data.get("supp_type"))
+            coins_consumed = to_int(data.get("coins_consumed"))
+            month_count = to_int(data.get("month_svip_supp_sign_count"))
+            month_left = to_int(data.get("month_svip_supp_sign_count_left"))
+            day_count = to_int(data.get("day_svip_supp_sign_count"))
+            if not quota_logged and month_count > 0:
+                quota_logged = True
+                result.month_left = month_left
+                result.month_total = month_count
+                result.day_limit = day_count
+                quota_text = f"剩余 {month_left}/{month_count} 次，每日限 {day_count} 次"
+                result.details["本月补签"] = quota_text
+                print(f"  · 本月补签{quota_text}")
+
+            if supp_type != 1:
+                if supp_type == 3:
+                    reason = f"需 {coins_consumed} 金币"
+                elif supp_type == 2:
+                    reason = "需完成任务"
+                else:
+                    reason = "当前不可用"
+                result.message = f"{date_text} {reason}，未自动补签"
+                print(f"  · {date_text} {reason}，跳过")
+                return result
+
+            if month_left <= 0:
+                result.message = "本月补签额度已用完"
+                return result
+
+            try:
+                sign_payload = self._api(
+                    API_COIN_SUPP_SIGN,
+                    {"day": number, "supp_type": 1},
+                    f"补签 {date_text}",
+                )
+            except (requests.RequestException, ValueError) as error:
+                result.message = f"{date_text} 补签请求失败：{error}"
+                print(f"  ❌ {result.message}")
+                return result
+
+            errno = to_int(sign_payload.get("errno"))
+            if errno == 0:
+                data = sign_payload.get("data")
+                new_days = to_int(data.get("signin_days")) if isinstance(data, dict) else 0
+                new_days = new_days or to_int(sign_data.get("signin_days"))
+                result.supplemented = True
+                result.date_text = date_text
+                result.message = f"已补签 {date_text}（连续 {new_days} 天）"
+                result.details["补签"] = f"{date_text}（连续 {new_days} 天）"
+                print(f"  ✅ 补签 {date_text} 成功（连续 {new_days} 天）")
+                return result
+
+            if errno == 35026:
+                result.message = "今日补签次数已用完"
+                print(f"  · {result.message}")
+                return result
+
+            result.message = f"{date_text} 补签失败（{errno_text(sign_payload)}）"
+            print(f"  ❌ {result.message}")
+            return result
+
+        return result
+
+    def _claim_sign_rewards(self, sign_data: dict[str, Any] | None) -> SignRewardResult:
+        result = SignRewardResult()
+        if not sign_data:
+            return result
+
+        rewards = sign_data.get("reward_list")
+        if not isinstance(rewards, list):
+            return result
+
+        claimable = [
+            item
+            for item in rewards
+            if isinstance(item, dict) and to_int(item.get("received")) == 1
+        ]
+        if not claimable:
+            return result
+
+        print(f"[签到] 发现 {len(claimable)} 个连续签到奖励")
+        messages: list[str] = []
+        for item in claimable:
+            day = to_int(item.get("day"))
+            if day <= 0:
+                continue
+            try:
+                payload = self._api(
+                    API_COIN_SIGN_AWARD,
+                    {"day": day},
+                    f"连续签到第 {day} 天奖励",
+                )
+            except (requests.RequestException, ValueError) as error:
+                print(f"[签到] 连续签到第 {day} 天奖励领取异常：{error}")
+                continue
+
+            errno = to_int(payload.get("errno"))
+            if errno == 0:
+                reward_text = format_prize_list(item.get("prize"))
+                result.claimed += 1
+                messages.append(f"第 {day} 天{(' ' + reward_text) if reward_text else ''}")
+                print(
+                    f"  ✅ 连续签到第 {day} 天奖励领取成功"
+                    f"{(' ' + reward_text) if reward_text else ''}",
+                )
+            elif errno == 36353:
+                print(f"  · 连续签到第 {day} 天奖励尚未达到领取条件")
+            else:
+                print(f"  ❌ 连续签到第 {day} 天奖励领取失败（{errno_text(payload)}）")
+            time.sleep(random.uniform(0.6, 1.2))
+
+        if messages:
+            result.message = "，".join(messages)
+            result.details["连续签到奖励"] = result.message
+        return result
+
     def _sign_in(self) -> SignInResult:
         print("[签到] 查询今日签到状态")
         days = 0
+        signed = False
+        already_signed = False
         try:
             home_payload = self._api(
                 API_COIN_HOME,
@@ -682,15 +930,10 @@ class BaiduPanTaskClient:
                 home_data = home_payload.get("data")
                 if isinstance(home_data, dict):
                     days = to_int(home_data.get("signin_days"))
-                    if to_int(home_data.get("signed")) == 1:
+                    already_signed = to_int(home_data.get("signed")) == 1
+                    signed = already_signed
+                    if already_signed:
                         print(f"  · 今日已签到（连续 {days} 天）")
-                        return SignInResult(
-                            status="今日已签到",
-                            message=f"今日已签到（连续 {days} 天）",
-                            signed=True,
-                            already=True,
-                            details={"连续签到": f"{days} 天"},
-                        )
             else:
                 print(
                     f"[签到] 状态查询失败（{errno_text(home_payload)}），"
@@ -700,80 +943,118 @@ class BaiduPanTaskClient:
             print(f"[签到] 状态查询异常：{error}")
 
         sign_task = self._find_sign_task()
-        if not sign_task:
-            return SignInResult(
-                status="签到失败",
-                message="未找到「今日签到领奖」任务，无法提交签到",
-                endpoint_ok=False,
-            )
-
-        task_id = str(sign_task.get("task_id_str") or sign_task.get("task_id") or "")
-        task_from = str(sign_task.get("task_from") or "")
-        if not task_id or not task_from:
-            return SignInResult(
-                status="签到失败",
-                message="签到任务缺少 task_id/task_from",
-                endpoint_ok=False,
-            )
-
-        sign_params = {
-            "is_growth": "0",
-            "task_id": task_id,
-            "task_id_str": task_id,
-            "task_from": task_from,
-        }
-        print("[签到] 提交签到")
-        try:
-            payload = self._api(API_COIN_SIGN, sign_params, "签到")
-        except (requests.RequestException, ValueError) as error:
-            return SignInResult(
-                status="签到失败",
-                message=f"签到请求失败：{error}",
-                endpoint_ok=False,
-            )
-
-        if to_int(payload.get("errno")) != 0:
-            return SignInResult(
-                status="签到失败",
-                message=f"签到失败（{errno_text(payload)}）",
-                endpoint_ok=False,
-            )
-
-        data = payload.get("data")
-        signed = isinstance(data, dict) and to_int(data.get("signed")) == 1
-        if isinstance(data, dict):
-            days = to_int(data.get("signin_days")) or days
-
-        time.sleep(0.6)
-        try:
-            verify_payload = self._api(API_COIN_SIGN_LIST, sign_params, "签到复核")
-            if to_int(verify_payload.get("errno")) == 0:
-                verify_data = verify_payload.get("data")
-                if isinstance(verify_data, dict):
-                    verify_days = to_int(verify_data.get("signin_days"))
-                    if verify_days > 0:
-                        days = verify_days
-                    if to_int(verify_data.get("signed_today")) == 1:
-                        signed = True
-            else:
-                print(f"[签到] 复核失败（{errno_text(verify_payload)}）")
-        except (requests.RequestException, ValueError) as error:
-            print(f"[签到] 复核异常：{error}")
-
         if not signed:
-            return SignInResult(
-                status="签到未生效",
-                message="签到接口返回成功，但今日签到状态仍未更新",
-                endpoint_ok=False,
-                details={"连续签到": f"{days} 天"} if days > 0 else {},
-            )
+            if not sign_task:
+                return SignInResult(
+                    status="签到失败",
+                    message="未找到「今日签到领奖」任务，无法提交签到",
+                    endpoint_ok=False,
+                )
 
-        print(f"  ✅ 签到成功（连续 {days} 天）")
+            task_id = str(sign_task.get("task_id_str") or sign_task.get("task_id") or "")
+            task_from = str(sign_task.get("task_from") or "")
+            if not task_id or not task_from:
+                return SignInResult(
+                    status="签到失败",
+                    message="签到任务缺少 task_id/task_from",
+                    endpoint_ok=False,
+                )
+
+            sign_params = self._build_sign_params(sign_task)
+            print("[签到] 提交签到")
+            try:
+                payload = self._api(API_COIN_SIGN, sign_params, "签到")
+            except (requests.RequestException, ValueError) as error:
+                return SignInResult(
+                    status="签到失败",
+                    message=f"签到请求失败：{error}",
+                    endpoint_ok=False,
+                )
+
+            if to_int(payload.get("errno")) != 0:
+                return SignInResult(
+                    status="签到失败",
+                    message=f"签到失败（{errno_text(payload)}）",
+                    endpoint_ok=False,
+                )
+
+            data = payload.get("data")
+            signed = isinstance(data, dict) and to_int(data.get("signed")) == 1
+            if isinstance(data, dict):
+                days = to_int(data.get("signin_days")) or days
+
+            time.sleep(0.6)
+            try:
+                verify_payload = self._api(API_COIN_SIGN_LIST, sign_params, "签到复核")
+                if to_int(verify_payload.get("errno")) == 0:
+                    verify_data = verify_payload.get("data")
+                    if isinstance(verify_data, dict):
+                        verify_days = to_int(verify_data.get("signin_days"))
+                        if verify_days > 0:
+                            days = verify_days
+                        if to_int(verify_data.get("signed_today")) == 1:
+                            signed = True
+                else:
+                    print(f"[签到] 复核失败（{errno_text(verify_payload)}）")
+            except (requests.RequestException, ValueError) as error:
+                print(f"[签到] 复核异常：{error}")
+
+            if not signed:
+                return SignInResult(
+                    status="签到未生效",
+                    message="签到接口返回成功，但今日签到状态仍未更新",
+                    endpoint_ok=False,
+                    details={"连续签到": f"{days} 天"} if days > 0 else {},
+                )
+            print(f"  ✅ 签到成功（连续 {days} 天）")
+
+        sign_data = self._fetch_sign_list(sign_task) if sign_task else None
+        if sign_data:
+            days = to_int(sign_data.get("signin_days")) or days
+
+        supplement_result = self._supplement_sign(sign_data)
+        if supplement_result.supplemented:
+            sign_data = self._fetch_sign_list(sign_task) if sign_task else sign_data
+            if sign_data:
+                days = to_int(sign_data.get("signin_days")) or days
+            if supplement_result.date_text:
+                supplement_result.message = (
+                    f"已补签 {supplement_result.date_text}（连续 {days} 天）"
+                )
+                supplement_result.details["补签"] = (
+                    f"{supplement_result.date_text}（连续 {days} 天）"
+                )
+            if supplement_result.month_total > 0:
+                remaining = max(supplement_result.month_left - 1, 0)
+                supplement_result.details["本月补签"] = (
+                    f"剩余 {remaining}/{supplement_result.month_total} 次，"
+                    f"每日限 {supplement_result.day_limit} 次"
+                )
+
+        reward_result = self._claim_sign_rewards(sign_data)
+
+        details: dict[str, str] = {"连续签到": f"{days} 天"}
+        details.update(supplement_result.details)
+        if supplement_result.message and not supplement_result.supplemented:
+            details["补签"] = supplement_result.message
+        details.update(reward_result.details)
+
+        message = (
+            f"今日已签到（连续 {days} 天）"
+            if already_signed
+            else f"签到成功（连续 {days} 天）"
+        )
+        if supplement_result.supplemented:
+            message += f"，{supplement_result.message}"
+        if reward_result.claimed:
+            message += f"，领取连续签到奖励 {reward_result.message}"
+
         return SignInResult(
-            status="签到成功",
-            message=f"签到成功（连续 {days} 天）",
+            status="今日已签到" if already_signed else "签到成功",
+            message=message,
             signed=True,
-            details={"连续签到": f"{days} 天"},
+            already=already_signed,
+            details=details,
         )
 
     def _claim_tasks(self, phase: str) -> ClaimSummary:
@@ -857,6 +1138,64 @@ class BaiduPanTaskClient:
         )
         return summary
 
+    def _find_growth_task(self, task_type: int) -> dict[str, Any] | None:
+        tasks, ok = self._fetch_tasks_from(
+            API_COIN_TASK_LIST,
+            GROWTH_TASK_FROM,
+            "成长任务列表",
+        )
+        if not ok:
+            return None
+        for task in tasks:
+            if to_int(task.get("task_type")) == task_type:
+                return task
+        return None
+
+    def _report_quiz_task(self) -> tuple[bool, str, bool]:
+        """答题后上报任务；返回（是否已处理，说明，是否需要领奖）。"""
+        task = self._find_growth_task(169)
+        if not task:
+            return False, "", False
+
+        task_id = str(task.get("task_id_str") or task.get("task_id") or "")
+        task_from = str(task.get("task_from") or "")
+        status = to_int(task.get("task_status"))
+        if status == 6:
+            return True, "答题任务待领取", True
+        if status == 1:
+            return True, "答题任务已完成", False
+        if status not in (0, 3):
+            return True, f"答题任务状态 {status}", False
+        if not task_id or not task_from:
+            return False, "答题任务缺少 task_id/task_from", False
+
+        print("[答题] 上报答题任务")
+        try:
+            payload = self._api(
+                API_TASK_SAVE,
+                {"task_id": task_id, "task_from": task_from},
+                "答题任务上报",
+            )
+        except (requests.RequestException, ValueError) as error:
+            print(f"[答题] 答题任务上报异常：{error}")
+            return False, f"答题任务上报异常：{error}", False
+
+        errno = to_int(payload.get("errno"))
+        if errno == 40003:
+            return True, "答题任务已领取", False
+        if errno != 0:
+            return False, f"答题任务上报失败（{errno_text(payload)}）", False
+
+        time.sleep(0.6)
+        refreshed = self._find_growth_task(169)
+        if refreshed:
+            refreshed_status = to_int(refreshed.get("task_status"))
+            if refreshed_status == 6:
+                return True, "答题任务已上报，待领取", True
+            if refreshed_status == 1:
+                return True, "答题任务已上报并完成", False
+        return True, "答题任务已上报", True
+
     def _choose_quiz_answer(self, question: dict[str, Any]) -> tuple[int, str]:
         if self.quiz_answer_override:
             parsed_override = parse_answer_value(self.quiz_answer_override)
@@ -908,11 +1247,17 @@ class BaiduPanTaskClient:
 
         if answer_status == 1:
             details = self._quiz_details(question)
+            _task_handled, task_message, should_claim = self._report_quiz_task()
+            if task_message:
+                details["答题任务"] = task_message
+            message = "今日已经答对过，无需重复答题"
+            if task_message:
+                message += f"，{task_message}"
             return QuizResult(
                 status="今日已答对",
-                message="今日已经答对过，无需重复答题",
+                message=message,
                 correct=True,
-                should_claim=False,
+                should_claim=should_claim,
                 details=details,
             )
         if answer_status == 2:
@@ -994,15 +1339,19 @@ class BaiduPanTaskClient:
                 details["答题积分"] = str(points)
                 reward_parts.append(f"积分 {points}")
             reward_text = "，".join(reward_parts)
+            _task_handled, task_message, should_claim = self._report_quiz_task()
+            if task_message:
+                details["答题任务"] = task_message
             print(f"  ✅ 回答正确{('，' + reward_text) if reward_text else ''}")
             return QuizResult(
                 status="回答正确",
                 message=(
                     f"回答正确（{answer_source}）"
                     + (f"，{reward_text}" if reward_text else "")
+                    + (f"，{task_message}" if task_message else "")
                 ),
                 correct=True,
-                should_claim=True,
+                should_claim=should_claim,
                 details=details,
             )
 
