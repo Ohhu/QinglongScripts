@@ -29,8 +29,10 @@ new Env('百度网盘任务系统签到')
      /coins/taskcenter/supptasklist 查询补签方式；只使用 SVIP 免费额度
      （supp_type=1）补最近一天，不消耗金币、不自动做补签任务，每日限 1 次；
   4. 调用 /act/v2/membergrowv2/getdailyquestion 获取判断题并提交答案；
-     答对后调用 /api/taskscore/tasksave 上报「每日答题」任务（task_type=169），
-     由 tasksave 完成该任务并发放成长值。
+     答对后调用 /api/taskscore/tasksave 上报「每日答题」任务（task_type=169）；
+  5. 任务进入 task_status=6（待领取）后调用 /api/taskscore/antisave
+     （action=receive_award）领取答题奖励，领取后再复核 task_status 是否变为 1。
+     网页端领取按钮走的正是 antisave；该接口不能带 hjs=1，否则返回 8001。
 
 请求需要复刻网页端的设备参数与 jt/token 签名。device 参数由 Cookie 中的
 BAIDUID 派生，保证同一账号每次运行使用同一设备标识。jt 签名会带上活动页
@@ -82,6 +84,7 @@ TASK_FROM = [
 API_TASK_LIST = "/api/taskscore/tasklist"
 API_COIN_TASK_LIST = "/coins/taskcenter/tasklist"
 API_TASK_SAVE = "/api/taskscore/tasksave"
+API_TASK_ANTI_SAVE = "/api/taskscore/antisave"
 API_LOGIN_STATUS = "/api/loginstatus"
 API_DAILY_QUESTION = "/act/v2/membergrowv2/getdailyquestion"
 API_ANSWER_QUESTION = "/act/v2/membergrowv2/answerquestion"
@@ -100,6 +103,7 @@ ERRNO_MEANING = {
     "0": "OK",
     "2": "参数错误",
     "40003": "已领取",
+    "40008": "任务当前不可领取",
     "8001": "HTJ 反作弊",
     "8002": "jsToken 校验失败",
     "8011": "作弊频控",
@@ -160,8 +164,8 @@ class QuizResult:
     status: str
     message: str
     correct: bool = False
-    should_claim: bool = False
     growth: int = 0
+    claim_growth: int = 0
     endpoint_ok: bool = True
     details: dict[str, str] = field(default_factory=dict)
 
@@ -347,6 +351,36 @@ def sum_growth_prizes(prizes: Any) -> int:
     return total
 
 
+def format_task_reward(payload: dict[str, Any]) -> str:
+    """从 antisave/tasksave 的 result 中拼出奖励文案。"""
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        result = payload.get("task_result")
+    if not isinstance(result, dict):
+        return ""
+    parts: list[str] = []
+    add_score = to_int(result.get("addScore"))
+    add_growth = to_int(result.get("addGrowScore"))
+    add_space = to_int(result.get("addSpace"))
+    if add_score > 0:
+        parts.append(f"+{add_score} 积分")
+    if add_growth > 0:
+        parts.append(f"+{add_growth} 成长值")
+    if add_space > 0:
+        space_unit = "GB" if to_int(result.get("space_unit"), 1) == 1 else "MB"
+        parts.append(f"+{add_space}{space_unit} 空间")
+    return "、".join(parts)
+
+
+def extract_task_growth(payload: dict[str, Any]) -> int:
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        result = payload.get("task_result")
+    if not isinstance(result, dict):
+        return 0
+    return max(to_int(result.get("addGrowScore")), 0)
+
+
 def parse_answer_value(value: Any) -> int | None:
     if isinstance(value, bool):
         return int(value)
@@ -446,13 +480,16 @@ class BaiduPanTaskClient:
             else:
                 signin_message = signin_result.message
 
+            quiz_growth = quiz_result.growth + quiz_result.claim_growth
             growth_total = (
                 signin_result.daily_growth
                 + signin_result.supplement_growth
                 + signin_result.reward_growth
-                + quiz_result.growth
+                + quiz_growth
             )
             details = {"今日成长值": f"+{growth_total}"}
+            if quiz_result.details.get("答题任务"):
+                details["答题任务"] = quiz_result.details["答题任务"]
             return AccountResult(
                 account_number=self.account_number,
                 account_label=account_label,
@@ -465,7 +502,7 @@ class BaiduPanTaskClient:
                 signin_growth=signin_result.daily_growth,
                 supplement_growth=signin_result.supplement_growth,
                 reward_growth=signin_result.reward_growth,
-                quiz_growth=quiz_result.growth,
+                quiz_growth=quiz_growth,
                 growth_total=growth_total,
                 warning=warning,
                 details=details,
@@ -532,7 +569,11 @@ class BaiduPanTaskClient:
             query.setdefault("uk", self.uk)
         query.setdefault("aid", AID)
 
-        query.setdefault("jt", make_jt(self.device, self.activity_url, "task"))
+        # 网页端 urlMap 把 antisave 的事件名映射为 task，领取时必须带 ev=task。
+        event = "task" if path == API_TASK_ANTI_SAVE else ""
+        if event:
+            query.setdefault("ev", event)
+        query.setdefault("jt", make_jt(self.device, self.activity_url, event or "task"))
         query.setdefault("rand", random_numeric_string())
         query.setdefault("rand2", random_numeric_string())
         query.setdefault("time", str(int(time.time() * 1000)))
@@ -547,9 +588,12 @@ class BaiduPanTaskClient:
         if path.startswith("/coins/"):
             query.setdefault("cuid", self.device.cuid)
             query.setdefault("idfv", self.device.idfv)
-        query.setdefault("hjs", "1")
+        # 实测 antisave 携带 hjs=1 会直接返回 8001，需省略；
+        # tasksave / tasklist 等接口保持 hjs=1。
+        if path != API_TASK_ANTI_SAVE:
+            query.setdefault("hjs", "1")
 
-        if path == API_TASK_SAVE:
+        if path in (API_TASK_SAVE, API_TASK_ANTI_SAVE):
             task_ids = str(query.get("task_ids") or query.get("task_id") or "")
             if task_ids and self.uk:
                 query["token"] = md5_hex(
@@ -1019,23 +1063,91 @@ class BaiduPanTaskClient:
                 return task
         return None
 
-    def _report_quiz_task(self) -> tuple[bool, str, bool]:
-        """答题后上报任务；返回（是否已处理，说明，是否需要领奖）。"""
+    def _claim_task_reward(
+        self,
+        task: dict[str, Any],
+        purpose: str,
+    ) -> tuple[bool, str, int]:
+        """调用 antisave receive_award 领取任务奖励。
+
+        网页端领取按钮会把任务对象整体作为请求参数提交，这里同样带上任务字段，
+        避免服务端判定参数缺失。返回（是否领取成功，说明，领取到的成长值）。
+        """
+        task_id = str(task.get("task_id_str") or task.get("task_id") or "")
+        task_name = str(task.get("task_name") or task_id or "任务")
+        if not task_id:
+            return False, f"{task_name}缺少 task_id", 0
+
+        params: dict[str, Any] = {
+            key: value
+            for key, value in task.items()
+            if value is not None and isinstance(value, (str, int, float, bool))
+        }
+        params.update(
+            {
+                "task_id": task_id,
+                "action": "receive_award",
+                "uk": self.uk,
+            },
+        )
+
+        print(f"[答题] 领取{task_name}奖励")
+        try:
+            payload = self._api(API_TASK_ANTI_SAVE, params, purpose)
+        except (requests.RequestException, ValueError) as error:
+            print(f"[答题] {task_name}奖励领取异常：{error}")
+            return False, f"{task_name}奖励领取异常", 0
+
+        errno = to_int(payload.get("errno"))
+        if errno == 0:
+            reward_text = format_task_reward(payload)
+            growth = extract_task_growth(payload)
+            message = f"已领取{task_name}奖励" + (
+                f" {reward_text}" if reward_text else ""
+            )
+            print(f"  ✅ {message}")
+            return True, message, growth
+        if errno in (40003, 40008):
+            print(f"  · {task_name}奖励当前不可领取（{errno_text(payload)}）")
+            return False, f"{task_name}奖励当前不可领取", 0
+        print(f"  ❌ {task_name}奖励领取失败（{errno_text(payload)}）")
+        return False, f"{task_name}奖励领取失败（{errno_text(payload)}）", 0
+
+    def _claim_quiz_task(self, task: dict[str, Any]) -> tuple[bool, str, int]:
+        """领取答题任务奖励，并复核 task_status 是否变为 1（已领取）。"""
+        claimed, message, growth = self._claim_task_reward(
+            task,
+            "领取答题奖励",
+        )
+        time.sleep(0.6)
+        refreshed = self._find_growth_task(169)
+        refreshed_status = to_int((refreshed or {}).get("task_status"), -1)
+        if claimed:
+            if refreshed_status == 1:
+                return True, message, growth
+            return True, f"{message}（任务状态 {refreshed_status}，可能延迟更新）", growth
+        if refreshed_status == 1:
+            # 重复领取时接口可能返回 40003/40008，以任务状态为准。
+            return True, "答题任务已领取", 0
+        return True, message, 0
+
+    def _report_quiz_task(self) -> tuple[bool, str, int]:
+        """答题后上报并领取任务奖励；返回（是否已处理，说明，领取到的成长值）。"""
         task = self._find_growth_task(169)
         if not task:
-            return False, "", False
+            return False, "", 0
 
         task_id = str(task.get("task_id_str") or task.get("task_id") or "")
         task_from = str(task.get("task_from") or "")
         status = to_int(task.get("task_status"))
         if status == 6:
-            return True, "答题任务待领取", True
+            return self._claim_quiz_task(task)
         if status == 1:
-            return True, "答题任务已完成", False
+            return True, "答题任务已完成", 0
         if status not in (0, 3):
-            return True, f"答题任务状态 {status}", False
+            return True, f"答题任务状态 {status}", 0
         if not task_id or not task_from:
-            return False, "答题任务缺少 task_id/task_from", False
+            return False, "答题任务缺少 task_id/task_from", 0
 
         print("[答题] 上报答题任务")
         try:
@@ -1046,23 +1158,23 @@ class BaiduPanTaskClient:
             )
         except (requests.RequestException, ValueError) as error:
             print(f"[答题] 答题任务上报异常：{error}")
-            return False, f"答题任务上报异常：{error}", False
+            return False, f"答题任务上报异常：{error}", 0
 
         errno = to_int(payload.get("errno"))
         if errno == 40003:
-            return True, "答题任务已领取", False
+            return True, "答题任务已领取", 0
         if errno != 0:
-            return False, f"答题任务上报失败（{errno_text(payload)}）", False
+            print(f"[答题] 答题任务上报失败（{errno_text(payload)}）")
+            return False, f"答题任务上报失败（{errno_text(payload)}）", 0
 
         time.sleep(0.6)
         refreshed = self._find_growth_task(169)
-        if refreshed:
-            refreshed_status = to_int(refreshed.get("task_status"))
-            if refreshed_status == 6:
-                return True, "答题任务已上报，待领取", True
-            if refreshed_status == 1:
-                return True, "答题任务已上报并完成", False
-        return True, "答题任务已上报", True
+        refreshed_status = to_int((refreshed or {}).get("task_status"), -1)
+        if refreshed_status == 6:
+            return self._claim_quiz_task(refreshed or task)
+        if refreshed_status == 1:
+            return True, "答题任务已完成", 0
+        return True, "答题任务已上报，奖励待领取", 0
 
     def _choose_quiz_answer(self, question: dict[str, Any]) -> tuple[int, str]:
         if self.quiz_answer_override:
@@ -1115,7 +1227,7 @@ class BaiduPanTaskClient:
 
         if answer_status == 1:
             details = self._quiz_details(question)
-            _task_handled, task_message, should_claim = self._report_quiz_task()
+            _task_handled, task_message, claim_growth = self._report_quiz_task()
             if task_message:
                 details["答题任务"] = task_message
             message = "今日已经答对过，无需重复答题"
@@ -1125,8 +1237,8 @@ class BaiduPanTaskClient:
                 status="今日已答对",
                 message=message,
                 correct=True,
-                should_claim=should_claim,
                 growth=to_int(question.get("score")),
+                claim_growth=claim_growth,
                 details=details,
             )
         if answer_status == 2:
@@ -1200,14 +1312,19 @@ class BaiduPanTaskClient:
             score = result.get("score", question.get("task_score"))
             growth = to_int(score)
             details["成长值"] = str(growth)
-            _task_handled, _task_message, should_claim = self._report_quiz_task()
-            print(f"  ✅ 回答正确，成长值 +{growth}")
+            _task_handled, task_message, claim_growth = self._report_quiz_task()
+            if task_message:
+                details["答题任务"] = task_message
+            print(
+                f"  ✅ 回答正确，成长值 +{growth}"
+                + (f"，{task_message}" if task_message else ""),
+            )
             return QuizResult(
                 status="回答正确",
                 message="答对",
                 correct=True,
-                should_claim=should_claim,
                 growth=to_int(score),
+                claim_growth=claim_growth,
                 details=details,
             )
 
