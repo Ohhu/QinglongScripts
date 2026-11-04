@@ -187,7 +187,6 @@ class AccountResult:
     supplement_growth: int = 0
     reward_growth: int = 0
     quiz_growth: int = 0
-    growth_total: int = 0
     warning: bool = False
     details: dict[str, str] = field(default_factory=dict)
 
@@ -483,14 +482,7 @@ class BaiduPanTaskClient:
             else:
                 signin_message = signin_result.message
 
-            quiz_growth = quiz_result.growth
-            growth_total = (
-                signin_result.daily_growth
-                + signin_result.supplement_growth
-                + signin_result.reward_growth
-                + quiz_growth
-            )
-            details = {"今日成长值": f"+{growth_total}"}
+            details: dict[str, str] = {}
             if quiz_result.details.get("答题任务"):
                 details["答题任务"] = quiz_result.details["答题任务"]
             return AccountResult(
@@ -505,8 +497,7 @@ class BaiduPanTaskClient:
                 signin_growth=signin_result.daily_growth,
                 supplement_growth=signin_result.supplement_growth,
                 reward_growth=signin_result.reward_growth,
-                quiz_growth=quiz_growth,
-                growth_total=growth_total,
+                quiz_growth=quiz_result.growth,
                 warning=warning,
                 details=details,
             )
@@ -1466,8 +1457,6 @@ def build_account_notification(result: AccountResult) -> tuple[str, str, str]:
         html_lines.append(f"• {label}：{escape_html_text(text)}{suffix}")
         plain_lines.append(f"• {label}：{text}{suffix}")
 
-    html_lines.append(f"• 今日成长值：{html_code(f'+{result.growth_total}')}")
-    plain_lines.append(f"• 今日成长值：+{result.growth_total}")
     html_lines.append(f"• 时间：{html_code(execution_time)}")
     plain_lines.append(f"• 时间：{execution_time}")
 
