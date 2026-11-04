@@ -33,6 +33,8 @@ new Env('百度网盘任务系统签到')
   5. 任务进入 task_status=6（待领取）后调用 /api/taskscore/antisave
      （action=receive_award）领取答题奖励，领取后再复核 task_status 是否变为 1。
      网页端领取按钮走的正是 antisave；该接口不能带 hjs=1，否则返回 8001。
+     答题奖励同时给积分与成长值：成长值只取 antisave 返回的 addGrowScore，
+     积分在 addScore；answerquestion 的 score 只是题目分值，不能计入成长值。
 
 请求需要复刻网页端的设备参数与 jt/token 签名。device 参数由 Cookie 中的
 BAIDUID 派生，保证同一账号每次运行使用同一设备标识。jt 签名会带上活动页
@@ -164,8 +166,9 @@ class QuizResult:
     status: str
     message: str
     correct: bool = False
+    # 仅统计真正入账的成长值（由 antisave 领奖返回的 addGrowScore 决定）；
+    # answerquestion 的 score 只是题目分值，不能计入成长值。
     growth: int = 0
-    claim_growth: int = 0
     endpoint_ok: bool = True
     details: dict[str, str] = field(default_factory=dict)
 
@@ -480,7 +483,7 @@ class BaiduPanTaskClient:
             else:
                 signin_message = signin_result.message
 
-            quiz_growth = quiz_result.growth + quiz_result.claim_growth
+            quiz_growth = quiz_result.growth
             growth_total = (
                 signin_result.daily_growth
                 + signin_result.supplement_growth
@@ -1226,8 +1229,8 @@ class BaiduPanTaskClient:
         print(f"[答题] {answer_status_text}")
 
         if answer_status == 1:
-            details = self._quiz_details(question)
-            _task_handled, task_message, claim_growth = self._report_quiz_task()
+            details: dict[str, str] = {}
+            _task_handled, task_message, growth = self._report_quiz_task()
             if task_message:
                 details["答题任务"] = task_message
             message = "今日已经答对过，无需重复答题"
@@ -1237,8 +1240,7 @@ class BaiduPanTaskClient:
                 status="今日已答对",
                 message=message,
                 correct=True,
-                growth=to_int(question.get("score")),
-                claim_growth=claim_growth,
+                growth=growth,
                 details=details,
             )
         if answer_status == 2:
@@ -1281,7 +1283,7 @@ class BaiduPanTaskClient:
         result = submit_payload.get("data")
         if not isinstance(result, dict):
             result = {}
-        details = self._quiz_details(result)
+        details: dict[str, str] = {}
         if to_int(result.get("answer_status")) == 1:
             time.sleep(0.6)
             try:
@@ -1309,22 +1311,15 @@ class BaiduPanTaskClient:
             except (requests.RequestException, ValueError) as error:
                 print(f"[答题] 复核异常：{error}")
 
-            score = result.get("score", question.get("task_score"))
-            growth = to_int(score)
-            details["成长值"] = str(growth)
-            _task_handled, task_message, claim_growth = self._report_quiz_task()
+            _task_handled, task_message, growth = self._report_quiz_task()
             if task_message:
                 details["答题任务"] = task_message
-            print(
-                f"  ✅ 回答正确，成长值 +{growth}"
-                + (f"，{task_message}" if task_message else ""),
-            )
+            print("  ✅ 回答正确" + (f"，{task_message}" if task_message else ""))
             return QuizResult(
                 status="回答正确",
                 message="答对",
                 correct=True,
-                growth=to_int(score),
-                claim_growth=claim_growth,
+                growth=growth,
                 details=details,
             )
 
@@ -1335,13 +1330,6 @@ class BaiduPanTaskClient:
             correct=False,
             details=details,
         )
-
-    @staticmethod
-    def _quiz_details(question: dict[str, Any]) -> dict[str, str]:
-        details: dict[str, str] = {}
-        if question.get("score") not in (None, ""):
-            details["成长值"] = str(question.get("score"))
-        return details
 
 
 def escape_html_text(value: Any) -> str:
